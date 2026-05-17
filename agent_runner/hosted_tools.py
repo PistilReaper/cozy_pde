@@ -8,7 +8,11 @@ from .config import RunnerConfig
 def build_hosted_tools(config: RunnerConfig, phase: str) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
 
-    if config.responses_tools.enable_web_search and phase in {"research", "planning"}:
+    if (
+        config.responses_tools.enable_web_search
+        and config.responses_tools.experimental_enable_hosted_web_search
+        and phase in {"research", "planning"}
+    ):
         tool: dict[str, Any] = {"type": "web_search"}
         web_cfg = config.responses_tools.web_search
         allowed_domains = web_cfg.get("allowed_domains")

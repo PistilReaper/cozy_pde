@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2010.08895v1</id>
+    <updated>2020-10-16T17:55:11Z</updated>
+    <published>2020-10-16T17:55:11Z</published>
+    <title>Fourier Neural Operator for Parametric Partial Differential Equations</title>
+    <summary>We propose the Fourier neural operator for learning solution operators of PDEs.</summary>
+    <author>
+      <name>Zongyi Li</name>
+    </author>
+    <author>
+      <name>Nikola Kovachki</name>
+    </author>
+    <link rel="alternate" type="text/html" href="https://arxiv.org/abs/2010.08895v1" />
+    <link rel="related" type="application/pdf" href="https://arxiv.org/pdf/2010.08895v1.pdf" />
+    <arxiv:primary_category term="cs.LG" scheme="http://arxiv.org/schemas/atom" />
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom" />
+    <category term="math.NA" scheme="http://arxiv.org/schemas/atom" />
+  </entry>
+</feed>

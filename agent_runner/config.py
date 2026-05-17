@@ -9,6 +9,25 @@ import yaml
 
 REQUIRED_WIRE_API = "responses"
 REQUIRED_PROFILE_NAMES = ("strong_planner", "coder", "log_summarizer", "json_judge")
+DEFAULT_RESEARCH_ALLOWED_DOMAINS = [
+    "arxiv.org",
+    "export.arxiv.org",
+    "github.com",
+    "raw.githubusercontent.com",
+    "openreview.net",
+    "neuraloperator.github.io",
+]
+DEFAULT_RESEARCH_BLOCKED_EXTENSIONS = [
+    ".hdf5",
+    ".h5",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".npz",
+    ".npy",
+    ".tar",
+    ".zip",
+]
 
 
 def _load_project_dotenv(project_root: Path) -> None:
@@ -147,7 +166,8 @@ class RouterConfig:
 
 @dataclass(slots=True)
 class ResponsesToolConfig:
-    enable_web_search: bool = True
+    enable_web_search: bool = False
+    experimental_enable_hosted_web_search: bool = False
     enable_file_search: bool = False
     enable_skills: bool = True
     enable_tool_search: bool = True
@@ -183,6 +203,9 @@ class ResponsesToolConfig:
         defaults = cls()
         return cls(
             enable_web_search=bool(data.get("enable_web_search", defaults.enable_web_search)),
+            experimental_enable_hosted_web_search=bool(
+                data.get("experimental_enable_hosted_web_search", defaults.experimental_enable_hosted_web_search)
+            ),
             enable_file_search=bool(data.get("enable_file_search", defaults.enable_file_search)),
             enable_skills=bool(data.get("enable_skills", defaults.enable_skills)),
             enable_tool_search=bool(data.get("enable_tool_search", defaults.enable_tool_search)),
@@ -220,6 +243,144 @@ class BudgetConfig:
 
 
 @dataclass(slots=True)
+class ResearchArxivProviderConfig:
+    enabled: bool = True
+    min_interval_seconds: float = 3.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResearchArxivProviderConfig":
+        data = data or {}
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            min_interval_seconds=float(data.get("min_interval_seconds", 3.0)),
+        )
+
+
+@dataclass(slots=True)
+class ResearchGitHubProviderConfig:
+    enabled: bool = True
+    api_key_env: str = "GITHUB_TOKEN"
+    api_key: str | None = None
+    allow_unauthenticated: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResearchGitHubProviderConfig":
+        data = data or {}
+        defaults = cls()
+        api_key_env = data.get("api_key_env", defaults.api_key_env)
+        return cls(
+            enabled=bool(data.get("enabled", defaults.enabled)),
+            api_key_env=api_key_env,
+            api_key=os.getenv(api_key_env),
+            allow_unauthenticated=bool(data.get("allow_unauthenticated", defaults.allow_unauthenticated)),
+        )
+
+
+@dataclass(slots=True)
+class ResearchWebProviderConfig:
+    provider_order: list[str] = field(default_factory=lambda: ["tavily", "exa", "brave", "google_cse"])
+    tavily_api_key_env: str = "TAVILY_API_KEY"
+    tavily_api_key: str | None = None
+    exa_api_key_env: str = "EXA_API_KEY"
+    exa_api_key: str | None = None
+    brave_api_key_env: str = "BRAVE_SEARCH_API_KEY"
+    brave_api_key: str | None = None
+    google_api_key_env: str = "GOOGLE_API_KEY"
+    google_api_key: str | None = None
+    google_cse_id_env: str = "GOOGLE_CSE_ID"
+    google_cse_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResearchWebProviderConfig":
+        data = data or {}
+        defaults = cls()
+        tavily_api_key_env = data.get("tavily_api_key_env", defaults.tavily_api_key_env)
+        exa_api_key_env = data.get("exa_api_key_env", defaults.exa_api_key_env)
+        brave_api_key_env = data.get("brave_api_key_env", defaults.brave_api_key_env)
+        google_api_key_env = data.get("google_api_key_env", defaults.google_api_key_env)
+        google_cse_id_env = data.get("google_cse_id_env", defaults.google_cse_id_env)
+        return cls(
+            provider_order=list(data.get("provider_order", defaults.provider_order)),
+            tavily_api_key_env=tavily_api_key_env,
+            tavily_api_key=os.getenv(tavily_api_key_env),
+            exa_api_key_env=exa_api_key_env,
+            exa_api_key=os.getenv(exa_api_key_env),
+            brave_api_key_env=brave_api_key_env,
+            brave_api_key=os.getenv(brave_api_key_env),
+            google_api_key_env=google_api_key_env,
+            google_api_key=os.getenv(google_api_key_env),
+            google_cse_id_env=google_cse_id_env,
+            google_cse_id=os.getenv(google_cse_id_env),
+        )
+
+
+@dataclass(slots=True)
+class ResearchProvidersConfig:
+    arxiv: ResearchArxivProviderConfig = field(default_factory=ResearchArxivProviderConfig)
+    github: ResearchGitHubProviderConfig = field(default_factory=ResearchGitHubProviderConfig)
+    web: ResearchWebProviderConfig = field(default_factory=ResearchWebProviderConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResearchProvidersConfig":
+        data = data or {}
+        return cls(
+            arxiv=ResearchArxivProviderConfig.from_dict(data.get("arxiv")),
+            github=ResearchGitHubProviderConfig.from_dict(data.get("github")),
+            web=ResearchWebProviderConfig.from_dict(data.get("web")),
+        )
+
+
+@dataclass(slots=True)
+class ResearchConfig:
+    enabled: bool = True
+    cache_dir: Path | str = "workspace/research/cache"
+    user_agent: str = "cozy_pde_research_agent/0.1"
+    request_timeout_seconds: int = 20
+    max_response_bytes: int = 5_000_000
+    max_pdf_bytes: int = 30_000_000
+    respect_robots_txt: bool = True
+    allow_raw_github: bool = True
+    providers: ResearchProvidersConfig = field(default_factory=ResearchProvidersConfig)
+    allowed_domains: list[str] = field(default_factory=lambda: list(DEFAULT_RESEARCH_ALLOWED_DOMAINS))
+    blocked_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_RESEARCH_BLOCKED_EXTENSIONS))
+    raw_cache_dir: Path | None = None
+    papers_dir: Path | None = None
+    cache_index_path: Path | None = None
+
+    def resolve_paths(self, project_root: Path) -> None:
+        cache_dir = Path(self.cache_dir)
+        if not cache_dir.is_absolute():
+            cache_dir = (project_root / cache_dir).resolve()
+        self.cache_dir = cache_dir
+        self.raw_cache_dir = cache_dir / "raw"
+        self.papers_dir = cache_dir.parent / "papers"
+        self.cache_index_path = cache_dir / "research_sources.jsonl"
+        self.allowed_domains = [domain.lower() for domain in self.allowed_domains]
+        self.blocked_extensions = [
+            extension.lower() if str(extension).startswith(".") else f".{str(extension).lower()}"
+            for extension in self.blocked_extensions
+        ]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResearchConfig":
+        data = data or {}
+        defaults = cls()
+        return cls(
+            enabled=bool(data.get("enabled", defaults.enabled)),
+            cache_dir=data.get("cache_dir", defaults.cache_dir),
+            user_agent=str(data.get("user_agent", defaults.user_agent)),
+            request_timeout_seconds=int(data.get("request_timeout_seconds", defaults.request_timeout_seconds)),
+            max_response_bytes=int(data.get("max_response_bytes", defaults.max_response_bytes)),
+            max_pdf_bytes=int(data.get("max_pdf_bytes", defaults.max_pdf_bytes)),
+            respect_robots_txt=bool(data.get("respect_robots_txt", defaults.respect_robots_txt)),
+            allow_raw_github=bool(data.get("allow_raw_github", defaults.allow_raw_github)),
+            providers=ResearchProvidersConfig.from_dict(data.get("providers")),
+            allowed_domains=list(data.get("allowed_domains", defaults.allowed_domains)),
+            blocked_extensions=list(data.get("blocked_extensions", defaults.blocked_extensions)),
+        )
+
+
+@dataclass(slots=True)
 class RunnerConfig:
     project_root: Path
     workspace_root: Path
@@ -227,6 +388,7 @@ class RunnerConfig:
     router: RouterConfig = field(default_factory=RouterConfig)
     llm_profiles: dict[str, LLMProfile] = field(default_factory=_default_profiles)
     responses_tools: ResponsesToolConfig = field(default_factory=ResponsesToolConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     shell_log_dir: Path | None = None
 
@@ -235,6 +397,7 @@ class RunnerConfig:
         self.workspace_root = self.workspace_root.resolve()
         self.llm_profiles = dict(self.llm_profiles)
         self._validate_profile_set()
+        self.research.resolve_paths(self.project_root)
         if self.shell_log_dir is None:
             self.shell_log_dir = self.workspace_root / "runs" / "logs"
 
@@ -281,6 +444,8 @@ class RunnerConfig:
             "runs/snapshots",
             "internal_logs",
             "llm_logs",
+            "research/cache/raw",
+            "research/papers",
             "submission/code",
         ]:
             (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
@@ -318,6 +483,7 @@ def load_config(config_path: str | Path, workspace_override: str | Path | None =
         router=RouterConfig.from_dict(raw.get("router")),
         llm_profiles=llm_profiles,
         responses_tools=ResponsesToolConfig.from_dict(raw.get("responses_tools")),
+        research=ResearchConfig.from_dict(raw.get("research")),
         budget=BudgetConfig.from_dict(raw.get("budget")),
     )
     config.ensure_workspace_dirs()

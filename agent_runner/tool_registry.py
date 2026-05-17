@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .config import RunnerConfig
 from .logger import ToolCallLogger
+from .research_cache import ResearchCache
 from .safety import WorkspaceSafety
 from .responses_items import ResponsesFunctionCall
 from .tools import failure
@@ -16,9 +17,10 @@ from .tools.hdf5_tools import inspect_hdf5
 from .tools.log_tools import analyze_log
 from .tools.package_tools import package_submission
 from .tools.python_tools import run_python
+from .tools.research_tools import fetch_pdf, fetch_url, parse_html, parse_pdf, search_arxiv, search_github, web_search
 from .tools.shell_tools import run_shell
 from .tools.snapshot_tools import rollback, snapshot
-from .tools.validate_tools import validate_jsonl_logs, validate_submission
+from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs, validate_submission
 
 
 @dataclass(slots=True)
@@ -27,6 +29,7 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     handler: Callable[..., dict[str, Any]]
+    allowed_phases: set[str] | None = None
 
 
 class ToolRegistry:
@@ -35,13 +38,22 @@ class ToolRegistry:
         self._logger = logger
         self._context: dict[str, Any] = {}
 
-    def set_context(self, *, task_id: str | None = None, step_id: str | None = None, mode: str | None = None) -> None:
+    def set_context(
+        self,
+        *,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        mode: str | None = None,
+        phase: str | None = None,
+    ) -> None:
         if task_id is not None:
             self._context["task_id"] = task_id
         if step_id is not None:
             self._context["step_id"] = step_id
         if mode is not None:
             self._context["mode"] = mode
+        if phase is not None:
+            self._context["phase"] = phase
 
     def __contains__(self, tool_name: str) -> bool:
         return tool_name in self._tools
@@ -50,6 +62,7 @@ class ToolRegistry:
         return self.response_function_tools()
 
     def response_function_tools(self) -> list[dict[str, Any]]:
+        active_phase = self._context.get("phase")
         return [
             {
                 "type": "function",
@@ -59,6 +72,7 @@ class ToolRegistry:
                 "strict": True,
             }
             for tool in self._tools.values()
+            if tool.allowed_phases is None or active_phase is None or active_phase in tool.allowed_phases
         ]
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -68,6 +82,15 @@ class ToolRegistry:
             return result
 
         tool = self._tools[tool_name]
+        active_phase = self._context.get("phase")
+        if tool.allowed_phases is not None and active_phase is not None and active_phase not in tool.allowed_phases:
+            result = failure(
+                tool_name,
+                f"Tool {tool_name} is not available in phase {active_phase}",
+                phase=active_phase,
+            )
+            self._logger.log_call(tool_name=tool_name, elapsed_seconds=0.0, arguments=arguments, result=result)
+            return result
         started = time.perf_counter()
         try:
             signature = inspect.signature(tool.handler)
@@ -96,6 +119,7 @@ def build_tool_registry(
     extra_read_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
     extra_tools: list[ToolDefinition] | None = None,
 ) -> ToolRegistry:
+    research_cache = ResearchCache(config.research)
     allowed_write_roots = (
         [
             config.workspace_root / "submission",
@@ -117,6 +141,39 @@ def build_tool_registry(
             return failure("validate_jsonl_logs", check.error or "read check failed", path=path)
         assert check.resolved_path is not None
         return validate_jsonl_logs(check.resolved_path)
+
+    def validate_responses_logs_tool(path: str, workspace_root: str | None = None) -> dict[str, Any]:
+        check = safety.validate_read_path(path)
+        if not check.ok:
+            return failure("validate_responses_logs", check.error or "read check failed", path=path)
+        assert check.resolved_path is not None
+        target_workspace = workspace_root or str(config.workspace_root)
+        return validate_responses_logs(check.resolved_path, workspace_root=target_workspace)
+
+    def parse_pdf_tool(path: str) -> dict[str, Any]:
+        check = safety.validate_read_path(path)
+        if not check.ok:
+            return failure("parse_pdf", check.error or "read check failed", path=path)
+        assert check.resolved_path is not None
+        return parse_pdf(path=str(check.resolved_path))
+
+    def parse_html_tool(path_or_url: str) -> dict[str, Any]:
+        if path_or_url.startswith(("http://", "https://")):
+            return parse_html(path_or_url=path_or_url, research=config.research)
+        check = safety.validate_read_path(path_or_url)
+        if not check.ok:
+            return failure("parse_html", check.error or "read check failed", path_or_url=path_or_url)
+        assert check.resolved_path is not None
+        return parse_html(path_or_url=str(check.resolved_path), research=config.research)
+
+    def research_cache_write_tool(record: dict[str, Any]) -> dict[str, Any]:
+        cached_record = research_cache.write(record)
+        return success(
+            "research_cache_write",
+            f"Cached research source {cached_record['source_id']}",
+            record=cached_record,
+            cache_path=str(research_cache.path),
+        )
 
     def validate_submission_tool(
         submission_dir: str = "submission",
@@ -183,6 +240,7 @@ def build_tool_registry(
                 if rehearsal_validation and str(path).startswith("submission/") and str(path).lower().endswith((".log", ".jsonl"))
                 else read_file(path=path, max_chars=max_chars, safety=safety)
             ),
+            allowed_phases={"research", "planning", "implementation", "debugging"},
         ),
         ToolDefinition(
             name="write_file",
@@ -198,6 +256,7 @@ def build_tool_registry(
                 safety=safety,
                 runner_context=runner_context,
             ),
+            allowed_phases={"planning", "implementation", "debugging"},
         ),
         ToolDefinition(
             name="list_files",
@@ -217,6 +276,7 @@ def build_tool_registry(
                 max_entries=max_entries,
                 safety=safety,
             ),
+            allowed_phases={"research", "planning", "implementation", "debugging"},
         ),
         ToolDefinition(
             name="run_shell",
@@ -243,6 +303,7 @@ def build_tool_registry(
                 if allow_run_shell
                 else failure("run_shell", "run_shell is disabled in this mode", command=command)
             ),
+            allowed_phases={"implementation", "debugging"},
         ),
         ToolDefinition(
             name="run_python",
@@ -253,6 +314,7 @@ def build_tool_registry(
                 "required": ["code"],
             },
             handler=lambda code, timeout_seconds=120: run_python(code=code, timeout_seconds=timeout_seconds, safety=safety, config=config),
+            allowed_phases={"implementation", "debugging"},
         ),
         ToolDefinition(
             name="inspect_hdf5",
@@ -263,6 +325,7 @@ def build_tool_registry(
                 "required": ["path"],
             },
             handler=lambda path: inspect_hdf5(path=path, safety=safety),
+            allowed_phases={"research", "planning", "implementation", "debugging"},
         ),
         ToolDefinition(
             name="validate_jsonl_logs",
@@ -273,6 +336,21 @@ def build_tool_registry(
                 "required": ["path"],
             },
             handler=validate_jsonl_logs_tool,
+            allowed_phases={"implementation", "debugging", "validation", "finalization"},
+        ),
+        ToolDefinition(
+            name="validate_responses_logs",
+            description="Validate that a Responses JSONL log file is traceable to generated submission/code files.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "workspace_root": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+            handler=validate_responses_logs_tool,
+            allowed_phases={"validation", "finalization"},
         ),
         ToolDefinition(
             name="validate_submission",
@@ -290,6 +368,7 @@ def build_tool_registry(
                 },
             },
             handler=validate_submission_tool,
+            allowed_phases={"implementation", "debugging", "validation", "finalization"},
         ),
         ToolDefinition(
             name="analyze_log",
@@ -300,12 +379,14 @@ def build_tool_registry(
                 "required": ["path"],
             },
             handler=lambda path: analyze_log(path=path, safety=safety),
+            allowed_phases={"implementation", "debugging", "log_analysis"},
         ),
         ToolDefinition(
             name="snapshot",
             description="Snapshot the current workspace/submission state into workspace/runs/snapshots.",
             parameters={"type": "object", "properties": {"label": {"type": "string"}}},
             handler=lambda label=None: snapshot(config=config, safety=safety, label=label),
+            allowed_phases={"implementation", "debugging"},
         ),
         ToolDefinition(
             name="rollback",
@@ -316,6 +397,7 @@ def build_tool_registry(
                 "required": ["snapshot_path"],
             },
             handler=lambda snapshot_path: rollback(config=config, safety=safety, snapshot_path=snapshot_path),
+            allowed_phases={"implementation", "debugging"},
         ),
         ToolDefinition(
             name="package_submission",
@@ -325,6 +407,162 @@ def build_tool_registry(
                 "properties": {"submission_dir": {"type": "string", "default": "submission"}, "test_hdf5": {"type": "string"}},
             },
             handler=package_submission_tool,
+            allowed_phases={"validation", "finalization"},
+        ),
+        ToolDefinition(
+            name="search_arxiv",
+            description="Search the official arXiv API and return normalized metadata records without downloading PDFs.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 10},
+                    "sort_by": {"type": "string", "default": "relevance"},
+                },
+                "required": ["query"],
+            },
+            handler=lambda query, max_results=10, sort_by="relevance": search_arxiv(
+                query=query,
+                max_results=max_results,
+                sort_by=sort_by,
+                research=config.research,
+            ),
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="search_github",
+            description="Search GitHub repositories or code via the official GitHub Search API.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "kind": {"type": "string", "default": "repositories"},
+                    "max_results": {"type": "integer", "default": 10},
+                },
+                "required": ["query"],
+            },
+            handler=lambda query, kind="repositories", max_results=10: search_github(
+                query=query,
+                kind=kind,
+                max_results=max_results,
+                research=config.research,
+            ),
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="web_search",
+            description="Use configured local search providers in order without scraping search result pages directly.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 10},
+                    "domains": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["query"],
+            },
+            handler=lambda query, max_results=10, domains=None: web_search(
+                query=query,
+                max_results=max_results,
+                domains=domains,
+                research=config.research,
+            ),
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="fetch_url",
+            description="Fetch a safe text URL from an allowed domain with policy checks and local caching.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "purpose": {"type": "string", "default": "read_code_or_paper"},
+                },
+                "required": ["url"],
+            },
+            handler=lambda url, purpose="read_code_or_paper": fetch_url(url=url, purpose=purpose, research=config.research),
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="fetch_pdf",
+            description="Fetch a safe PDF from an allowed domain and store it under workspace/research/papers.",
+            parameters={
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+            handler=lambda url: fetch_pdf(url=url, research=config.research),
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="parse_pdf",
+            description="Extract text from a locally stored PDF using a local parser when available.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            handler=parse_pdf_tool,
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="parse_html",
+            description="Extract title, text, code blocks, and links from HTML content or a safe allowed URL.",
+            parameters={
+                "type": "object",
+                "properties": {"path_or_url": {"type": "string"}},
+                "required": ["path_or_url"],
+            },
+            handler=parse_html_tool,
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="research_cache_write",
+            description="Write a normalized research record into workspace/research/cache/research_sources.jsonl.",
+            parameters={
+                "type": "object",
+                "properties": {"record": {"type": "object"}},
+                "required": ["record"],
+            },
+            handler=research_cache_write_tool,
+            allowed_phases={"research", "planning"},
+        ),
+        ToolDefinition(
+            name="research_cache_read",
+            description="Read one or more cached research records by source_id or URL.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "url": {"type": "string"},
+                },
+            },
+            handler=lambda source_id=None, url=None: success(
+                "research_cache_read",
+                "Loaded cached research records",
+                records=research_cache.read(source_id=source_id, url=url),
+                cache_path=str(research_cache.path),
+            ),
+            allowed_phases={"research", "planning", "log_analysis"},
+        ),
+        ToolDefinition(
+            name="research_cache_search",
+            description="Search cached research records by keyword.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 10},
+                },
+                "required": ["query"],
+            },
+            handler=lambda query, max_results=10: success(
+                "research_cache_search",
+                f"Found cached research matches for {query!r}",
+                records=research_cache.search(query, max_results=max_results),
+                cache_path=str(research_cache.path),
+            ),
+            allowed_phases={"research", "planning"},
         ),
     ]
     if extra_tools:

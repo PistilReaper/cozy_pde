@@ -1,0 +1,27 @@
+{
+  "total_count": 1,
+  "incomplete_results": false,
+  "items": [
+    {
+      "name": "fourier_2d.py",
+      "path": "neuralop/models/fourier_2d.py",
+      "sha": "abc123",
+      "html_url": "https://github.com/neuraloperator/neuraloperator/blob/main/neuralop/models/fourier_2d.py",
+      "repository": {
+        "name": "neuraloperator",
+        "full_name": "neuraloperator/neuraloperator",
+        "html_url": "https://github.com/neuraloperator/neuraloperator",
+        "default_branch": "main",
+        "description": "Neural operator learning library.",
+        "stargazers_count": 4200,
+        "updated_at": "2026-05-01T12:00:00Z",
+        "owner": {
+          "login": "neuraloperator"
+        },
+        "license": {
+          "spdx_id": "MIT"
+        }
+      }
+    }
+  ]
+}

@@ -17,6 +17,7 @@ import numpy as np
 from .config import RunnerConfig, load_config
 from .hosted_tools import build_hosted_tools
 from .logger import LLMCallLogger, ToolCallLogger
+from .research_cache import ResearchCache
 from .prompts import (
     REHEARSAL_PROMPT,
     SYSTEM_PROMPT,
@@ -40,6 +41,7 @@ from .skills import build_skill_catalog, load_local_skills
 from .state import AgentState
 from .tool_registry import ToolDefinition, ToolRegistry, build_tool_registry
 from .tools import failure, success
+from .tools.research_tools import fetch_pdf, fetch_url, parse_pdf, search_arxiv, search_github, web_search
 from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs
 
 SECRET_PATTERNS = [
@@ -447,6 +449,7 @@ def execute_agent_loop(
             phase_hint=phase_hint,
         )
         profile = config.llm_profiles[route.profile]
+        registry.set_context(phase=route.phase)
         local_tools = registry.response_function_tools()
         hosted_tools = build_hosted_tools(config, phase=route.phase) if route.enable_hosted_tools else []
         response = _call_model(
@@ -560,9 +563,9 @@ def run_test_tool_loop(config: RunnerConfig) -> int:
     return 0 if ok else 0
 
 
-def run_live_api_check(config: RunnerConfig) -> int:
+def run_provider_health_check(config: RunnerConfig) -> int:
     if not config.endpoint.api_key:
-        print(f"LLM API key is not configured. Set {config.endpoint.api_key_env} before running live_api_check.")
+        print(f"LLM API key is not configured. Set {config.endpoint.api_key_env} before running provider_health_check.")
         return 1
 
     _prepare_session_logs(config)
@@ -575,10 +578,10 @@ def run_live_api_check(config: RunnerConfig) -> int:
     simple_response = _call_model(
         client=client,
         llm_logger=llm_logger,
-        ledger=[user_text("This is live_api_check step 1. Reply with a short confirmation sentence.")],
+        ledger=[user_text("This is provider_health_check step 1. Reply with a short confirmation sentence.")],
         tools=[],
         instructions="Reply with one short sentence only.",
-        task_id="live_api_check",
+        task_id="provider_health_check",
         step_id="simple_response",
         state=state,
         profile_name="coder",
@@ -600,15 +603,17 @@ def run_live_api_check(config: RunnerConfig) -> int:
     )
     echo_items = [
         system_text("You are validating function tool-calling. You must call echo_tool exactly once."),
-        user_text("Call echo_tool with text 'hello-tool'. After receiving the tool result, summarize it briefly and include LIVE_API_CHECK_COMPLETE."),
+        user_text(
+            "Call echo_tool with text 'hello-tool'. After receiving the tool result, summarize it briefly and include PROVIDER_HEALTH_CHECK_COMPLETE."
+        ),
     ]
     echo_ok, echo_text = _run_tool_round(
         config=config,
-        task_id="live_api_echo_tool",
+        task_id="provider_health_echo_tool",
         items=echo_items,
         registry=live_registry,
         client=client,
-        completion_token="LIVE_API_CHECK_COMPLETE",
+        completion_token="PROVIDER_HEALTH_CHECK_COMPLETE",
     )
     if not echo_ok:
         print(f"FAIL echo_tool_call: {echo_text}")
@@ -618,23 +623,23 @@ def run_live_api_check(config: RunnerConfig) -> int:
     write_items = [
         system_text("You are validating write_file tool-calling. Do not use submission/code."),
         user_text(
-            "Call write_file and write one line of text to workspace/runs/scratch/live_api_check.txt. "
-            "After the tool result, reply with LIVE_API_CHECK_COMPLETE and a short summary."
+            "Call write_file and write one line of text to workspace/runs/scratch/provider_health_check.txt. "
+            "After the tool result, reply with PROVIDER_HEALTH_CHECK_COMPLETE and a short summary."
         ),
     ]
     write_ok, write_text = _run_tool_round(
         config=config,
-        task_id="live_api_write_file",
+        task_id="provider_health_write_file",
         items=write_items,
         registry=live_registry,
         client=client,
-        completion_token="LIVE_API_CHECK_COMPLETE",
+        completion_token="PROVIDER_HEALTH_CHECK_COMPLETE",
     )
     if not write_ok:
         print(f"FAIL write_file_tool_call: {write_text}")
         return 1
-    if not (config.workspace_root / "runs" / "scratch" / "live_api_check.txt").exists():
-        print("FAIL write_file_tool_call: live_api_check.txt was not created")
+    if not (config.workspace_root / "runs" / "scratch" / "provider_health_check.txt").exists():
+        print("FAIL write_file_tool_call: provider_health_check.txt was not created")
         return 1
     checks.append("PASS write_file_tool_call")
 
@@ -652,35 +657,183 @@ def run_live_api_check(config: RunnerConfig) -> int:
     return 0
 
 
-def run_research_api_check(config: RunnerConfig) -> int:
-    if not config.endpoint.api_key:
-        print(f"LLM API key is not configured. Set {config.endpoint.api_key_env} before running research_api_check.")
+def run_local_research_check(config: RunnerConfig, http_client=None) -> int:
+    if not config.research.enabled:
+        print("FAIL local_research_check: research config is disabled")
         return 1
 
-    _prepare_session_logs(config)
-    client = ResponsesClient(config.endpoint)
-    llm_logger = LLMCallLogger(config.llm_log_path)
-    state = AgentState(config.budget)
-    response = _call_model(
-        client=client,
-        llm_logger=llm_logger,
-        ledger=[user_text("Find one relevant arXiv or GitHub source for neural operators and summarize it briefly.")],
-        tools=build_hosted_tools(config, phase="research"),
-        instructions="Use hosted research tools when helpful. Keep the answer short.",
-        task_id="research_api_check",
-        step_id="research_step",
-        state=state,
-        profile_name="strong_planner",
-        phase="research",
-        profile_override=config.llm_profiles["strong_planner"],
+    config.ensure_workspace_dirs()
+    cache = ResearchCache(config.research)
+    report_lines = [
+        "# Local Research Check",
+        "",
+        "This report verifies local research tools without requiring hosted Responses web_search.",
+        "",
+    ]
+
+    arxiv_result = search_arxiv(
+        query="Fourier Neural Operator Burgers PDEBench",
+        research=config.research,
+        http_client=http_client,
     )
-    if not extract_output_text(response).strip():
-        print("FAIL research_api_check: empty response")
+    if not arxiv_result["ok"] or not arxiv_result["data"]["results"]:
+        print(f"FAIL local_research_check arXiv: {arxiv_result.get('error', 'no results')}")
         return 1
-    if validate_jsonl_logs(config.llm_log_path)["ok"] is not True:
-        print("FAIL research_api_check: llm logs invalid")
+    arxiv_record = arxiv_result["data"]["results"][0]
+    cache.write(
+        {
+            "source_id": f"arxiv:{arxiv_record['arxiv_id']}",
+            "source_type": "arxiv",
+            "title": arxiv_record["title"],
+            "url": arxiv_record["abs_url"],
+            "raw_url": arxiv_record["pdf_url"],
+            "query": arxiv_result["data"]["query"],
+            "summary": arxiv_record["abstract"][:400],
+            "content_sha256": "",
+            "raw_cache_path": "",
+            "license_hint": "",
+            "risk_flags": [],
+            "allowed_for_submission_code_reference": True,
+            "allowed_for_training_data": False,
+        }
+    )
+    report_lines.extend(
+        [
+            "## arXiv",
+            "",
+            f"- title: {arxiv_record['title']}",
+            f"- abs_url: {arxiv_record['abs_url']}",
+            f"- pdf_url: {arxiv_record['pdf_url']}",
+            "",
+        ]
+    )
+
+    github_queries = [
+        "neuraloperator Fourier neural operator Burgers",
+        "neuraloperator",
+    ]
+    github_result = None
+    github_query_used = github_queries[0]
+    for github_query in github_queries:
+        github_result = search_github(
+            query=github_query,
+            research=config.research,
+            http_client=http_client,
+        )
+        if github_result["ok"] and github_result["data"]["results"]:
+            github_query_used = github_query
+            break
+    if not github_result["ok"] or not github_result["data"]["results"]:
+        print(f"FAIL local_research_check GitHub: {github_result.get('error', 'no results')}")
         return 1
-    print("PASS research_api_check")
+    github_record = github_result["data"]["results"][0]
+    github_source_id = f"github:{github_record['owner']}/{github_record['repo']}"
+    if github_record["path"]:
+        github_source_id = f"{github_source_id}:{github_record['path']}"
+    cache.write(
+        {
+            "source_id": github_source_id,
+            "source_type": github_record["source_type"],
+            "title": github_record["path"] or github_record["repo"],
+            "url": github_record["url"],
+            "raw_url": github_record["raw_url"],
+            "query": github_query_used,
+            "summary": github_record["summary"],
+            "content_sha256": "",
+            "raw_cache_path": "",
+            "license_hint": github_record["license_hint"],
+            "risk_flags": [],
+            "allowed_for_submission_code_reference": True,
+            "allowed_for_training_data": False,
+        }
+    )
+    report_lines.extend(
+        [
+            "## GitHub",
+            "",
+            f"- query_used: {github_query_used}",
+            f"- repo: {github_record['owner']}/{github_record['repo']}",
+            f"- url: {github_record['url']}",
+            f"- raw_url: {github_record['raw_url'] or '(not available for repository search)'}",
+            "",
+        ]
+    )
+
+    web_result = web_search(
+        query="PDEBench Burgers FNO baseline",
+        domains=["github.com", "arxiv.org"],
+        research=config.research,
+        http_client=http_client,
+    )
+    if web_result["data"]["provider"] is None:
+        report_lines.extend(
+            [
+                "## Web Search",
+                "",
+                "- local provider search skipped because no configured provider key was available",
+                f"- skipped_providers: {', '.join(web_result['data']['skipped_providers']) or 'none'}",
+                "",
+            ]
+        )
+    else:
+        report_lines.extend(
+            [
+                "## Web Search",
+                "",
+                f"- provider: {web_result['data']['provider']}",
+                f"- results: {len(web_result['data']['results'])}",
+                "",
+            ]
+        )
+
+    fetch_target = github_record["raw_url"] or arxiv_record["abs_url"]
+    fetch_result = fetch_url(url=fetch_target, research=config.research, http_client=http_client)
+    if not fetch_result["ok"]:
+        print(f"FAIL local_research_check fetch_url: {fetch_result['error']}")
+        return 1
+    report_lines.extend(
+        [
+            "## fetch_url",
+            "",
+            f"- url: {fetch_result['data']['url']}",
+            f"- content_type: {fetch_result['data']['content_type']}",
+            f"- cache_path: {fetch_result['data']['cache_path']}",
+            "",
+        ]
+    )
+
+    try:
+        import pypdf  # noqa: F401
+
+        pdf_parser_available = True
+    except ImportError:
+        pdf_parser_available = False
+
+    if pdf_parser_available and arxiv_record["pdf_url"]:
+        pdf_result = fetch_pdf(url=arxiv_record["pdf_url"], research=config.research, http_client=http_client)
+        if pdf_result["ok"]:
+            parsed_pdf = parse_pdf(path=pdf_result["data"]["local_path"])
+            if parsed_pdf["ok"]:
+                report_lines.extend(
+                    [
+                        "## PDF Parse",
+                        "",
+                        f"- page_count: {parsed_pdf['data']['page_count']}",
+                        "",
+                    ]
+                )
+            else:
+                report_lines.extend(["## PDF Parse", "", f"- skipped: {parsed_pdf['error']}", ""])
+        else:
+            report_lines.extend(["## PDF Parse", "", f"- skipped: {pdf_result['error']}", ""])
+    else:
+        report_lines.extend(["## PDF Parse", "", "- skipped: local PDF parser is unavailable", ""])
+
+    report_path = config.workspace_root / "runs" / "local_research_report.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(report_lines).strip() + "\n", encoding="utf-8")
+
+    print("PASS local_research_check")
     return 0
 
 
@@ -1048,8 +1201,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[
             "preflight",
             "test_tool_loop",
-            "live_api_check",
-            "research_api_check",
+            "provider_health_check",
+            "local_research_check",
             "autonomous",
             "autonomous_dry_run",
             "autonomous_rehearsal",
@@ -1074,10 +1227,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_preflight(config)
     if args.mode == "test_tool_loop":
         return run_test_tool_loop(config)
-    if args.mode == "live_api_check":
-        return run_live_api_check(config)
-    if args.mode == "research_api_check":
-        return run_research_api_check(config)
+    if args.mode == "provider_health_check":
+        return run_provider_health_check(config)
+    if args.mode == "local_research_check":
+        return run_local_research_check(config)
     if args.mode == "autonomous":
         return run_autonomous(config, tasks, args.max_steps)
     if args.mode == "autonomous_dry_run":

@@ -57,7 +57,7 @@ def _normalize_phase(phase: str | None, summary: str) -> str:
 def _fallback_route(*, summary: str, phase_hint: str | None) -> RouteDecision:
     phase = _normalize_phase(phase_hint, summary)
     if phase in {"research", "planning"}:
-        return RouteDecision("strong_planner", phase, True, "Fallback routing for research/planning.")
+        return RouteDecision("strong_planner", phase, False, "Fallback routing for research/planning.")
     if phase in {"implementation", "debugging"}:
         return RouteDecision("coder", phase, False, "Fallback routing for code work.")
     if phase == "log_analysis":
@@ -118,9 +118,7 @@ class Router:
         if profile not in ALLOWED_PROFILES or phase not in ALLOWED_PHASES:
             return _fallback_route(summary=summary, phase_hint=phase_hint)
 
-        if profile == "strong_planner":
-            enable_hosted_tools = True
-        elif profile in {"coder", "log_summarizer", "json_judge"} and "enable_hosted_tools" not in payload:
+        if profile in {"coder", "log_summarizer", "json_judge"} and "enable_hosted_tools" not in payload:
             enable_hosted_tools = False
 
         return RouteDecision(

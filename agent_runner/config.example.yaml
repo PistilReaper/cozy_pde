@@ -49,7 +49,8 @@ openai:
   streaming: false
 
 responses_tools:
-  enable_web_search: true
+  enable_web_search: false
+  experimental_enable_hosted_web_search: false
   enable_file_search: false
   enable_skills: true
   enable_tool_search: true
@@ -69,6 +70,52 @@ responses_tools:
       - neural_operator_research
       - hdf5_validation
       - rollout_training
+
+research:
+  enabled: true
+  cache_dir: workspace/research/cache
+  user_agent: "cozy_pde_research_agent/0.1"
+  request_timeout_seconds: 20
+  max_response_bytes: 5000000
+  max_pdf_bytes: 30000000
+  respect_robots_txt: true
+  allow_raw_github: true
+  providers:
+    arxiv:
+      enabled: true
+      min_interval_seconds: 3
+    github:
+      enabled: true
+      api_key_env: GITHUB_TOKEN
+      allow_unauthenticated: true
+    web:
+      provider_order:
+        - tavily
+        - exa
+        - brave
+        - google_cse
+      tavily_api_key_env: TAVILY_API_KEY
+      exa_api_key_env: EXA_API_KEY
+      brave_api_key_env: BRAVE_SEARCH_API_KEY
+      google_api_key_env: GOOGLE_API_KEY
+      google_cse_id_env: GOOGLE_CSE_ID
+  allowed_domains:
+    - arxiv.org
+    - export.arxiv.org
+    - github.com
+    - raw.githubusercontent.com
+    - openreview.net
+    - neuraloperator.github.io
+  blocked_extensions:
+    - .hdf5
+    - .h5
+    - .pt
+    - .pth
+    - .ckpt
+    - .npz
+    - .npy
+    - .tar
+    - .zip
 
 budget:
   max_wall_clock_hours: 11.5
