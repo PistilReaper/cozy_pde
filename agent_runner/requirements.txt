@@ -1,0 +1,7 @@
+openai>=2.0.0
+PyYAML>=6.0
+h5py>=3.10
+numpy>=1.26
+pytest>=8.0
+# torch is expected to be installed separately for training environments.
+

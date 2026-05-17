@@ -1,0 +1,9 @@
+# Minimal rehearsal configuration for Task 1
+# Task 1 may use official PDEBench checkpoint in a formal run, but no checkpoint is available in this rehearsal.
+task: 1
+model: tiny_temporal_conv
+context_steps: 10
+total_steps: 200
+train_from_scratch: true
+use_official_checkpoint_if_available: true
+smoke_budget_seconds: 600

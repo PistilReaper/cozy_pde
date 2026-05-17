@@ -1,0 +1,9 @@
+# Minimal rehearsal configuration for Task 2
+# Task 2 must be trained from scratch and cannot reuse Task 1 checkpoint or Task 1 data.
+task: 2
+model: tiny_temporal_conv
+context_steps: 10
+total_steps: 200
+train_from_scratch: true
+reuse_task1_artifacts: false
+smoke_budget_seconds: 600

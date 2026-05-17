@@ -1,0 +1,6 @@
+$ python -m py_compile submission/code/*.py
+[stdout]
+
+[stderr]
+
+[returncode] 0

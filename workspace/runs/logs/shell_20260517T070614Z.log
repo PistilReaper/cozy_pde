@@ -1,0 +1,20 @@
+$ PYTHONPATH=submission/code python - <<'PY'
+from data_utils import build_persistence_prediction
+from model import TinyTemporalConvNet
+import numpy as np
+import torch
+x=np.zeros((2,10,256), dtype=np.float32)
+y=build_persistence_prediction(x)
+assert y.shape==(2,200,256)
+assert np.allclose(y[:,:10], x)
+m=TinyTemporalConvNet(width=4)
+z=m(torch.zeros(2,256))
+assert tuple(z.shape)==(2,256)
+print('import_and_shape_ok')
+PY
+[stdout]
+import_and_shape_ok
+
+[stderr]
+
+[returncode] 0
