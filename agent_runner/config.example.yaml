@@ -4,7 +4,7 @@ router:
   model: gpt-5.4
   reasoning_effort: medium
   verbosity: medium
-  wire_api: responses
+  wire_api: json_action
   temperature: 0.0
   max_tokens: 2048
 
@@ -13,7 +13,7 @@ llm_profiles:
     model: gpt-5.5
     reasoning_effort: xhigh
     verbosity: medium
-    wire_api: responses
+    wire_api: json_action
     temperature: 0.2
     max_tokens: 8192
 
@@ -21,7 +21,7 @@ llm_profiles:
     model: gpt-5.4
     reasoning_effort: high
     verbosity: medium
-    wire_api: responses
+    wire_api: json_action
     temperature: 0.2
     max_tokens: 8192
 
@@ -29,7 +29,7 @@ llm_profiles:
     model: gpt-5.2
     reasoning_effort: medium
     verbosity: low
-    wire_api: responses
+    wire_api: json_action
     temperature: 0.0
     max_tokens: 4096
 
@@ -37,7 +37,7 @@ llm_profiles:
     model: gpt-5.2
     reasoning_effort: medium
     verbosity: low
-    wire_api: responses
+    wire_api: json_action
     temperature: 0.0
     max_tokens: 2048
 
@@ -45,8 +45,22 @@ openai:
   provider: third_party_openai_compatible
   base_url: "https://aixj.vip"
   api_key_env: "LLM_API_KEY"
+  append_v1: true
   store: false
   streaming: false
+
+fallback_provider:
+  enabled: true
+  provider: deepseek_openai_compatible
+  base_url: "https://api.deepseek.com"
+  api_key_env: "DEEPSEEK_API_KEY"
+  append_v1: false
+  pro_model_env: "DEEPSEEK_PRO_MODEL"
+  flash_model_env: "DEEPSEEK_FLASH_MODEL"
+
+responses:
+  max_tool_calls_per_turn: 1
+  retry_on_multi_tool_failure: true
 
 responses_tools:
   enable_web_search: false

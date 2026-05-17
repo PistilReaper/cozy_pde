@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-REQUIRED_WIRE_API = "responses"
+REQUIRED_WIRE_API = "json_action"
 REQUIRED_PROFILE_NAMES = ("strong_planner", "coder", "log_summarizer", "json_judge")
 DEFAULT_RESEARCH_ALLOWED_DOMAINS = [
     "arxiv.org",
@@ -94,8 +94,13 @@ class OpenAIEndpointConfig:
     base_url: str = "https://example.com"
     api_key_env: str = "LLM_API_KEY"
     api_key: str | None = None
+    append_v1: bool = True
     store: bool = False
     streaming: bool = False
+
+    def resolve_env(self) -> None:
+        if self.api_key is None:
+            self.api_key = os.getenv(self.api_key_env)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "OpenAIEndpointConfig":
@@ -107,8 +112,51 @@ class OpenAIEndpointConfig:
             base_url=data.get("base_url", defaults.base_url),
             api_key_env=api_key_env,
             api_key=os.getenv(api_key_env),
+            append_v1=bool(data.get("append_v1", defaults.append_v1)),
             store=bool(data.get("store", defaults.store)),
             streaming=bool(data.get("streaming", defaults.streaming)),
+        )
+
+
+@dataclass(slots=True)
+class FallbackProviderConfig:
+    enabled: bool = True
+    provider: str = "deepseek_openai_compatible"
+    base_url: str = "https://api.deepseek.com"
+    api_key_env: str = "DEEPSEEK_API_KEY"
+    api_key: str | None = None
+    append_v1: bool = False
+    pro_model_env: str = "DEEPSEEK_PRO_MODEL"
+    pro_model: str | None = None
+    flash_model_env: str = "DEEPSEEK_FLASH_MODEL"
+    flash_model: str | None = None
+
+    def resolve_env(self) -> None:
+        if self.api_key is None:
+            self.api_key = os.getenv(self.api_key_env)
+        if self.pro_model is None:
+            self.pro_model = os.getenv(self.pro_model_env)
+        if self.flash_model is None:
+            self.flash_model = os.getenv(self.flash_model_env)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "FallbackProviderConfig":
+        data = data or {}
+        defaults = cls()
+        api_key_env = data.get("api_key_env", defaults.api_key_env)
+        pro_model_env = data.get("pro_model_env", defaults.pro_model_env)
+        flash_model_env = data.get("flash_model_env", defaults.flash_model_env)
+        return cls(
+            enabled=bool(data.get("enabled", defaults.enabled)),
+            provider=data.get("provider", defaults.provider),
+            base_url=data.get("base_url", defaults.base_url),
+            api_key_env=api_key_env,
+            api_key=os.getenv(api_key_env),
+            append_v1=bool(data.get("append_v1", defaults.append_v1)),
+            pro_model_env=pro_model_env,
+            pro_model=os.getenv(pro_model_env),
+            flash_model_env=flash_model_env,
+            flash_model=os.getenv(flash_model_env),
         )
 
 
@@ -213,6 +261,25 @@ class ResponsesToolConfig:
             file_search=dict(data.get("file_search", defaults.file_search)),
             skills=dict(data.get("skills", defaults.skills)),
             tool_search=dict(data.get("tool_search", defaults.tool_search)),
+        )
+
+
+@dataclass(slots=True)
+class ResponsesRuntimeConfig:
+    max_tool_calls_per_turn: int = 1
+    parallel_tool_calls: bool = False
+    retry_on_multi_tool_failure: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ResponsesRuntimeConfig":
+        data = data or {}
+        defaults = cls()
+        return cls(
+            max_tool_calls_per_turn=int(data.get("max_tool_calls_per_turn", defaults.max_tool_calls_per_turn)),
+            parallel_tool_calls=bool(data.get("parallel_tool_calls", defaults.parallel_tool_calls)),
+            retry_on_multi_tool_failure=bool(
+                data.get("retry_on_multi_tool_failure", defaults.retry_on_multi_tool_failure)
+            ),
         )
 
 
@@ -385,8 +452,10 @@ class RunnerConfig:
     project_root: Path
     workspace_root: Path
     endpoint: OpenAIEndpointConfig = field(default_factory=OpenAIEndpointConfig)
+    fallback_provider: FallbackProviderConfig = field(default_factory=FallbackProviderConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     llm_profiles: dict[str, LLMProfile] = field(default_factory=_default_profiles)
+    responses: ResponsesRuntimeConfig = field(default_factory=ResponsesRuntimeConfig)
     responses_tools: ResponsesToolConfig = field(default_factory=ResponsesToolConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
@@ -395,6 +464,8 @@ class RunnerConfig:
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
         self.workspace_root = self.workspace_root.resolve()
+        self.endpoint.resolve_env()
+        self.fallback_provider.resolve_env()
         self.llm_profiles = dict(self.llm_profiles)
         self._validate_profile_set()
         self.research.resolve_paths(self.project_root)
@@ -454,6 +525,7 @@ class RunnerConfig:
     def from_workspace(cls, workspace_root: str | Path, project_root: str | Path | None = None) -> "RunnerConfig":
         workspace_root = Path(workspace_root)
         project_root = Path(project_root) if project_root is not None else workspace_root.parent
+        _load_project_dotenv(project_root)
         config = cls(project_root=project_root, workspace_root=workspace_root)
         config.ensure_workspace_dirs()
         return config
@@ -480,8 +552,10 @@ def load_config(config_path: str | Path, workspace_override: str | Path | None =
         project_root=project_root,
         workspace_root=workspace_root,
         endpoint=OpenAIEndpointConfig.from_dict(raw.get("openai")),
+        fallback_provider=FallbackProviderConfig.from_dict(raw.get("fallback_provider")),
         router=RouterConfig.from_dict(raw.get("router")),
         llm_profiles=llm_profiles,
+        responses=ResponsesRuntimeConfig.from_dict(raw.get("responses")),
         responses_tools=ResponsesToolConfig.from_dict(raw.get("responses_tools")),
         research=ResearchConfig.from_dict(raw.get("research")),
         budget=BudgetConfig.from_dict(raw.get("budget")),

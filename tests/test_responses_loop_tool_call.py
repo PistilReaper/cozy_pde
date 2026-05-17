@@ -44,15 +44,23 @@ class FakeLoopResponsesClient:
             return {
                 "output": [
                     {
-                        "type": "function_call",
-                        "call_id": "call_1",
-                        "name": "write_file",
-                        "arguments": json.dumps(
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
                             {
-                                "path": "submission/code/hello.py",
-                                "content": "print('hello from responses')\n",
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "type": "action",
+                                        "tool_name": "write_file",
+                                        "arguments": {
+                                            "path": "submission/code/hello.py",
+                                            "content": "print('hello from responses')\n",
+                                        },
+                                    }
+                                ),
                             }
-                        ),
+                        ],
                     }
                 ]
             }
@@ -61,7 +69,12 @@ class FakeLoopResponsesClient:
                 {
                     "type": "message",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "RUNNER_FINALIZED"}],
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps({"type": "final", "message": "RUNNER_FINALIZED"}),
+                        }
+                    ],
                 }
             ]
         }

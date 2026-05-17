@@ -65,6 +65,72 @@ def _output_items(response: Any) -> list[Any]:
     return list(getattr(response, "output", []) or [])
 
 
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def _parse_action_json(text: str) -> Any | None:
+    stripped = _strip_code_fence(text)
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def _action_calls_from_payload(payload: Any) -> list[ResponsesFunctionCall]:
+    if not isinstance(payload, dict):
+        return []
+
+    actions = payload.get("actions")
+    if isinstance(actions, list):
+        calls: list[ResponsesFunctionCall] = []
+        for index, action in enumerate(actions, start=1):
+            if not isinstance(action, dict):
+                continue
+            tool_name = action.get("tool_name")
+            arguments = action.get("arguments")
+            if isinstance(tool_name, str) and isinstance(arguments, dict):
+                calls.append(
+                    ResponsesFunctionCall(
+                        name=tool_name,
+                        arguments=arguments,
+                        call_id=str(action.get("call_id") or f"json_action_{index}"),
+                        raw_arguments=arguments,
+                    )
+                )
+        return calls
+
+    tool_name = payload.get("tool_name")
+    arguments = payload.get("arguments")
+    action_type = payload.get("type")
+    if action_type == "action" and isinstance(tool_name, str) and isinstance(arguments, dict):
+        return [
+            ResponsesFunctionCall(
+                name=tool_name,
+                arguments=arguments,
+                call_id=str(payload.get("call_id") or "json_action_1"),
+                raw_arguments=arguments,
+            )
+        ]
+    if isinstance(tool_name, str) and isinstance(arguments, dict):
+        return [
+            ResponsesFunctionCall(
+                name=tool_name,
+                arguments=arguments,
+                call_id=str(payload.get("call_id") or "json_action_1"),
+                raw_arguments=arguments,
+            )
+        ]
+    return []
+
+
 def extract_output_text(response: Any) -> str:
     if isinstance(response, dict) and response.get("output_text"):
         return str(response["output_text"])
@@ -110,7 +176,21 @@ def extract_function_calls(response: Any) -> list[ResponsesFunctionCall]:
                 raw_arguments=raw_arguments,
             )
         )
-    return calls
+    if calls:
+        return calls
+    payload = _parse_action_json(extract_output_text(response))
+    return _action_calls_from_payload(payload)
+
+
+def extract_final_output_text(response: Any) -> str | None:
+    payload = _parse_action_json(extract_output_text(response))
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") == "final" and isinstance(payload.get("message"), str):
+        return str(payload["message"])
+    if isinstance(payload.get("final"), str):
+        return str(payload["final"])
+    return None
 
 
 def extract_hosted_tool_calls(response: Any) -> list[dict[str, Any]]:

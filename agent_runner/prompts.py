@@ -19,6 +19,7 @@ SYSTEM_PROMPT = """你是 PDE 神经算子竞赛自主科研 Agent。
 
 行为要求：
 - 在工具可完成任务时优先调用工具。
+- 每个响应最多只能调用一个 function tool；如果需要多个操作，必须分多轮串行调用。
 - 每次修改后先做最小 validate，再决定是否训练。
 - 当预算接近 finalize 保留时间时，停止新实验并完成提交校验与打包。
 - 当你认为提交已经可用时，明确输出 RUNNER_FINALIZED。
@@ -40,6 +41,7 @@ REHEARSAL_PROMPT = """你现在处于 autonomous_rehearsal 模式，不是正式
 11. 最后输出 REHEARSAL_COMPLETE 并写 rehearsal report。
 12. 如果当前没有可用的正式数据文件，不要伪造 HDF5 数据，不要尝试 smoke training，用最小代码骨架 + 明确的数据缺失报告完成 rehearsal。
 13. 不要读取 submission/task1_logs.log 或 submission/task2_logs.log 这类旧会话日志，它们不属于 rehearsal 所需信息。
+14. 每个响应最多只能调用一个 function tool；如果需要多个操作，必须分多轮串行调用。
 """
 
 TEST_TOOL_LOOP_PROMPT = """请调用 write_file，在 workspace/submission/code/hello.py 写入一个最小 Python 文件。

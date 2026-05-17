@@ -23,6 +23,48 @@ from .tools.snapshot_tools import rollback, snapshot
 from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs, validate_submission
 
 
+def _schema_type_matches(value: Any, expected: str, item_schema: dict[str, Any] | None = None) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        if not isinstance(value, list):
+            return False
+        if item_schema and item_schema.get("type") == "string":
+            return all(isinstance(item, str) for item in value)
+        return True
+    return True
+
+
+def _validate_arguments_against_schema(schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:
+    if not isinstance(arguments, dict):
+        return "tool arguments must be a JSON object"
+
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    for name in required:
+        if name not in arguments:
+            return f"missing required argument {name}"
+    for name in arguments:
+        if name not in properties:
+            return f"unexpected argument {name}"
+    for name, value in arguments.items():
+        property_schema = properties.get(name, {})
+        expected_type = property_schema.get("type")
+        if isinstance(expected_type, str) and not _schema_type_matches(
+            value,
+            expected_type,
+            property_schema.get("items") if isinstance(property_schema.get("items"), dict) else None,
+        ):
+            return f"argument {name} must be of type {expected_type}"
+    return None
+
+
 @dataclass(slots=True)
 class ToolDefinition:
     name: str
@@ -45,6 +87,7 @@ class ToolRegistry:
         step_id: str | None = None,
         mode: str | None = None,
         phase: str | None = None,
+        exposed_tool_names: set[str] | None = None,
     ) -> None:
         if task_id is not None:
             self._context["task_id"] = task_id
@@ -54,6 +97,8 @@ class ToolRegistry:
             self._context["mode"] = mode
         if phase is not None:
             self._context["phase"] = phase
+        if exposed_tool_names is not None:
+            self._context["exposed_tool_names"] = set(exposed_tool_names)
 
     def __contains__(self, tool_name: str) -> bool:
         return tool_name in self._tools
@@ -63,6 +108,7 @@ class ToolRegistry:
 
     def response_function_tools(self) -> list[dict[str, Any]]:
         active_phase = self._context.get("phase")
+        exposed_tool_names = self._context.get("exposed_tool_names")
         return [
             {
                 "type": "function",
@@ -72,7 +118,10 @@ class ToolRegistry:
                 "strict": True,
             }
             for tool in self._tools.values()
-            if tool.allowed_phases is None or active_phase is None or active_phase in tool.allowed_phases
+            if (
+                (tool.allowed_phases is None or active_phase is None or active_phase in tool.allowed_phases)
+                and (exposed_tool_names is None or tool.name in exposed_tool_names)
+            )
         ]
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -83,12 +132,26 @@ class ToolRegistry:
 
         tool = self._tools[tool_name]
         active_phase = self._context.get("phase")
+        exposed_tool_names = self._context.get("exposed_tool_names")
         if tool.allowed_phases is not None and active_phase is not None and active_phase not in tool.allowed_phases:
             result = failure(
                 tool_name,
                 f"Tool {tool_name} is not available in phase {active_phase}",
                 phase=active_phase,
             )
+            self._logger.log_call(tool_name=tool_name, elapsed_seconds=0.0, arguments=arguments, result=result)
+            return result
+        if exposed_tool_names is not None and tool_name not in exposed_tool_names:
+            result = failure(
+                tool_name,
+                f"Tool {tool_name} is not exposed in the current turn",
+                phase=active_phase,
+            )
+            self._logger.log_call(tool_name=tool_name, elapsed_seconds=0.0, arguments=arguments, result=result)
+            return result
+        schema_error = _validate_arguments_against_schema(tool.parameters, arguments)
+        if schema_error is not None:
+            result = failure(tool_name, f"Schema validation failed: {schema_error}")
             self._logger.log_call(tool_name=tool_name, elapsed_seconds=0.0, arguments=arguments, result=result)
             return result
         started = time.perf_counter()
@@ -226,6 +289,44 @@ def build_tool_registry(
             test_path = test_check.resolved_path
         return package_submission(submission_dir=dir_check.resolved_path, test_hdf5=test_path)
 
+    def validate_full_submission_tool(
+        submission_dir: str = "submission",
+        test_hdf5: str | None = None,
+        responses_log_path: str = "llm_logs/all_llm_calls.jsonl",
+        workspace_root: str | None = None,
+        pred_filename: str = "pred.hdf5",
+        time_filename: str = "time.csv",
+        logs_filename: str = "logs.log",
+        code_dir: str | None = None,
+        rehearsal_mode: bool = rehearsal_validation,
+    ) -> dict[str, Any]:
+        submission_result = validate_submission_tool(
+            submission_dir=submission_dir,
+            test_hdf5=test_hdf5,
+            pred_filename=pred_filename,
+            time_filename=time_filename,
+            logs_filename=logs_filename,
+            code_dir=code_dir,
+            rehearsal_mode=rehearsal_mode,
+        )
+        responses_result = validate_responses_logs_tool(
+            path=responses_log_path,
+            workspace_root=workspace_root or str(config.workspace_root),
+        )
+        if submission_result["ok"] and responses_result["ok"]:
+            return success(
+                "validate_full_submission",
+                "Validated submission bundle and responses provenance.",
+                submission=submission_result,
+                responses_logs=responses_result,
+            )
+        return failure(
+            "validate_full_submission",
+            "Validation failed for submission bundle or responses provenance.",
+            submission=submission_result,
+            responses_logs=responses_result,
+        )
+
     tools = [
         ToolDefinition(
             name="read_file",
@@ -256,27 +357,7 @@ def build_tool_registry(
                 safety=safety,
                 runner_context=runner_context,
             ),
-            allowed_phases={"planning", "implementation", "debugging"},
-        ),
-        ToolDefinition(
-            name="list_files",
-            description="List files under a workspace directory.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "recursive": {"type": "boolean", "default": False},
-                    "max_entries": {"type": "integer", "default": 200},
-                },
-                "required": ["path"],
-            },
-            handler=lambda path, recursive=False, max_entries=200: list_files(
-                path=path,
-                recursive=recursive,
-                max_entries=max_entries,
-                safety=safety,
-            ),
-            allowed_phases={"research", "planning", "implementation", "debugging"},
+            allowed_phases={"implementation", "debugging"},
         ),
         ToolDefinition(
             name="run_shell",
@@ -325,18 +406,7 @@ def build_tool_registry(
                 "required": ["path"],
             },
             handler=lambda path: inspect_hdf5(path=path, safety=safety),
-            allowed_phases={"research", "planning", "implementation", "debugging"},
-        ),
-        ToolDefinition(
-            name="validate_jsonl_logs",
-            description="Validate that a JSONL log file contains ISO timestamps, elapsed_seconds, and response or tool_calls.",
-            parameters={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-            handler=validate_jsonl_logs_tool,
-            allowed_phases={"implementation", "debugging", "validation", "finalization"},
+            allowed_phases={"validation", "finalization"},
         ),
         ToolDefinition(
             name="validate_responses_logs",
@@ -368,7 +438,7 @@ def build_tool_registry(
                 },
             },
             handler=validate_submission_tool,
-            allowed_phases={"implementation", "debugging", "validation", "finalization"},
+            allowed_phases={"validation", "finalization"},
         ),
         ToolDefinition(
             name="analyze_log",
@@ -407,6 +477,26 @@ def build_tool_registry(
                 "properties": {"submission_dir": {"type": "string", "default": "submission"}, "test_hdf5": {"type": "string"}},
             },
             handler=package_submission_tool,
+            allowed_phases={"validation", "finalization"},
+        ),
+        ToolDefinition(
+            name="validate_full_submission",
+            description="Run validate_submission and validate_responses_logs as one deterministic validation tool.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "submission_dir": {"type": "string", "default": "submission"},
+                    "test_hdf5": {"type": "string"},
+                    "responses_log_path": {"type": "string", "default": "llm_logs/all_llm_calls.jsonl"},
+                    "workspace_root": {"type": "string"},
+                    "pred_filename": {"type": "string", "default": "pred.hdf5"},
+                    "time_filename": {"type": "string", "default": "time.csv"},
+                    "logs_filename": {"type": "string", "default": "logs.log"},
+                    "code_dir": {"type": "string"},
+                    "rehearsal_mode": {"type": "boolean", "default": rehearsal_validation},
+                },
+            },
+            handler=validate_full_submission_tool,
             allowed_phases={"validation", "finalization"},
         ),
         ToolDefinition(

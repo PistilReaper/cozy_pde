@@ -19,7 +19,7 @@ ALLOWED_PHASES = {
     "finalization",
 }
 
-ROUTER_PROMPT = """You are a routing controller for a Responses-only agent.
+ROUTER_PROMPT = """You are a routing controller for a JSON-action agent.
 Return a single JSON object with keys:
 - profile: one of strong_planner, coder, log_summarizer, json_judge
 - phase: one of research, planning, implementation, debugging, log_analysis, validation, finalization

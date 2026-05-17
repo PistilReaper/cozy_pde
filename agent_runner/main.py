@@ -15,7 +15,6 @@ import h5py
 import numpy as np
 
 from .config import RunnerConfig, load_config
-from .hosted_tools import build_hosted_tools
 from .logger import LLMCallLogger, ToolCallLogger
 from .research_cache import ResearchCache
 from .prompts import (
@@ -28,15 +27,15 @@ from .prompts import (
 )
 from .responses_client import ResponsesClient
 from .responses_items import (
+    extract_final_output_text,
     extract_function_calls,
-    extract_hosted_tool_calls,
     extract_output_text,
     function_call_output,
     response_to_ledger_items,
     system_text,
     user_text,
 )
-from .router import Router
+from .router import RouteDecision, Router
 from .skills import build_skill_catalog, load_local_skills
 from .state import AgentState
 from .tool_registry import ToolDefinition, ToolRegistry, build_tool_registry
@@ -51,6 +50,17 @@ SECRET_PATTERNS = [
     re.compile(r"\bbearer\b", re.IGNORECASE),
 ]
 TEXT_SCAN_SUFFIXES = {".json", ".jsonl", ".log", ".txt", ".csv", ".md", ".py", ".yaml", ".yml"}
+ACTION_PROTOCOL_RULE = (
+    "You do not execute tools directly. "
+    "Respond with exactly one JSON object and nothing else. "
+    'Use {"type":"action","tool_name":"<tool>","arguments":{...}} when one local tool is needed. '
+    'Use {"type":"final","message":"RUNNER_FINALIZED"} only when the task is actually complete. '
+    "Never emit multiple actions in one response and never wrap JSON in markdown."
+)
+ACTION_PROTOCOL_RETRY_RULE = (
+    "Retry now with exactly one valid JSON object in the action protocol format. "
+    "Do not emit prose, markdown, or multiple actions."
+)
 
 
 def _load_docs_context(project_root: Path, max_chars_per_file: int = 12000) -> str:
@@ -110,6 +120,63 @@ def _prepare_session_logs(config: RunnerConfig) -> None:
     config.tool_log_path.parent.mkdir(parents=True, exist_ok=True)
     config.llm_log_path.write_text("", encoding="utf-8")
     config.tool_log_path.write_text("", encoding="utf-8")
+
+
+def _instruction_with_tool_guardrail(
+    *,
+    instructions: str,
+    tools: list[dict[str, Any]],
+    stronger: bool = False,
+    narrowed_tool_names: list[str] | None = None,
+) -> str:
+    rule = ACTION_PROTOCOL_RETRY_RULE if stronger else ACTION_PROTOCOL_RULE
+    if narrowed_tool_names and len(narrowed_tool_names) == 1:
+        rule = f"{rule} The only allowed tool in this response is {narrowed_tool_names[0]}."
+    if not tools:
+        return f"{instructions}\n\n{rule}"
+    tool_manifest = json.dumps(
+        [
+            {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters"),
+            }
+            for tool in tools
+            if tool.get("type") == "function"
+        ],
+        ensure_ascii=False,
+    )
+    return f"{instructions}\n\n{rule}\n\nAllowed tools for this response:\n{tool_manifest}"
+
+
+def _tool_names_from_ledger(ledger: list[dict[str, Any]], tool_names: list[str]) -> list[str]:
+    texts: list[str] = []
+    for item in ledger:
+        for content_item in item.get("content", []):
+            text = content_item.get("text")
+            if text:
+                texts.append(str(text))
+    combined = "\n".join(texts)
+    return [tool_name for tool_name in tool_names if tool_name in combined]
+
+
+def _narrow_tools_for_retry(tools: list[dict[str, Any]], ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tool_names = [tool["name"] for tool in tools if tool.get("type") == "function" and tool.get("name")]
+    matches = _tool_names_from_ledger(ledger, tool_names)
+    if len(matches) != 1:
+        return tools
+    return [tool for tool in tools if tool.get("name") == matches[0]]
+
+
+def _serialize_function_calls(response: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": call.name,
+            "arguments": call.arguments,
+            "call_id": call.call_id,
+        }
+        for call in extract_function_calls(response)
+    ]
 
 
 def _sha256_file(path: Path) -> str:
@@ -361,7 +428,7 @@ def _call_model(
 ) -> Any:
     profile = profile_override
     if profile is None:
-        raise ValueError("profile_override is required for Responses-only calls")
+        raise ValueError("profile_override is required for JSON-action calls")
     started = time.perf_counter()
     response = client.create(
         profile=profile,
@@ -376,27 +443,19 @@ def _call_model(
         },
     )
     elapsed = time.perf_counter() - started
-    tool_calls = [
-        {
-            "name": call.name,
-            "arguments": call.arguments,
-            "call_id": call.call_id,
-        }
-        for call in extract_function_calls(response)
-    ]
-    hosted_tool_calls = extract_hosted_tool_calls(response)
+    tool_calls = _serialize_function_calls(response)
     content = extract_output_text(response)
+    logged_model = str(response.get("model") or profile.model) if isinstance(response, dict) else profile.model
     llm_logger.log_call(
         step_id=step_id,
         task_id=task_id,
-        model=profile.model,
+        model=logged_model,
         profile=profile_name,
         phase=phase,
         elapsed_seconds=elapsed,
         response=content or None,
         tool_calls=tool_calls or None,
-        hosted_tool_calls=hosted_tool_calls or None,
-        raw_response=response,
+        raw_response=response.get("raw_response", response) if isinstance(response, dict) else response,
     )
     state.record_llm_call()
     return response
@@ -414,8 +473,10 @@ def execute_agent_loop(
     continue_instruction: str = "继续 autonomous loop。需要具体动作时必须调用工具；只有在校验和打包完成后才能输出 RUNNER_FINALIZED。",
     system_prompt: str = SYSTEM_PROMPT,
     phase_hint: str | None = None,
+    fixed_route: RouteDecision | None = None,
+    exposed_tool_names: set[str] | None = None,
 ) -> tuple[bool, list[dict[str, Any]], str]:
-    client = client or ResponsesClient(config.endpoint)
+    client = client or ResponsesClient(config.endpoint, config.responses, config.fallback_provider)
     llm_logger = LLMCallLogger(config.llm_log_path)
     tool_logger = ToolCallLogger(config.tool_log_path)
     registry = registry or build_tool_registry(
@@ -436,45 +497,98 @@ def execute_agent_loop(
     for step_index in range(1, max_steps + 1):
         state.record_step()
         step_id = f"step-{step_index:03d}"
-        registry.set_context(task_id=task_id, step_id=step_id)
+        registry.set_context(task_id=task_id, step_id=step_id, exposed_tool_names=exposed_tool_names)
         if state.should_finalize():
             ledger.append(
                 system_text("预算接近上限。停止新实验，优先 validate、导出 task logs、生成提交文件并调用 package_submission。")
             )
 
-        route = router.choose(
+        route = fixed_route or router.choose(
             summary=last_text or continue_instruction,
             task_id=task_id,
             step_id=step_id,
             phase_hint=phase_hint,
         )
         profile = config.llm_profiles[route.profile]
-        registry.set_context(phase=route.phase)
+        registry.set_context(phase=route.phase, exposed_tool_names=exposed_tool_names)
         local_tools = registry.response_function_tools()
-        hosted_tools = build_hosted_tools(config, phase=route.phase) if route.enable_hosted_tools else []
-        response = _call_model(
-            client=client,
-            llm_logger=llm_logger,
-            ledger=ledger,
-            tools=hosted_tools + local_tools,
-            instructions=instructions,
-            task_id=task_id,
-            step_id=step_id,
-            state=state,
-            profile_name=profile.name,
-            phase=route.phase,
-            profile_override=profile,
-        )
+        active_tools = local_tools
+        retry_count = 0
+
+        while True:
+            narrowed_tool_names = [tool["name"] for tool in active_tools if tool.get("type") == "function" and tool.get("name")]
+            active_instructions = _instruction_with_tool_guardrail(
+                instructions=instructions,
+                tools=active_tools,
+                stronger=retry_count > 0,
+                narrowed_tool_names=narrowed_tool_names,
+            )
+            try:
+                response = _call_model(
+                    client=client,
+                    llm_logger=llm_logger,
+                    ledger=ledger,
+                    tools=active_tools,
+                    instructions=active_instructions,
+                    task_id=task_id,
+                    step_id=step_id,
+                    state=state,
+                    profile_name=profile.name,
+                    phase=route.phase,
+                    profile_override=profile,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return False, ledger, f"provider_multi_tool_or_gateway_error: {exc}"
+
+            function_calls = extract_function_calls(response)
+            if len(function_calls) > config.responses.max_tool_calls_per_turn:
+                tool_logger.log_call(
+                    tool_name="multi_tool_call_violation",
+                    elapsed_seconds=0.0,
+                    arguments={
+                        "task_id": task_id,
+                        "step_id": step_id,
+                        "profile": profile.name,
+                        "phase": route.phase,
+                        "tool_calls": _serialize_function_calls(response),
+                    },
+                    result=failure(
+                        "multi_tool_call_violation",
+                        f"Model emitted {len(function_calls)} tool calls in one response.",
+                    ),
+                )
+                if config.responses.retry_on_multi_tool_failure and retry_count < 1:
+                    retry_count += 1
+                    active_tools = _narrow_tools_for_retry(active_tools, ledger)
+                    ledger.append(user_text("You emitted multiple actions. Retry with exactly one action JSON object."))
+                    continue
+                return False, ledger, "multi_tool_call_violation: model emitted multiple tool calls"
+
+            final_text = extract_final_output_text(response)
+            raw_text = extract_output_text(response).strip()
+            if final_text is None and completion_token in raw_text:
+                final_text = raw_text
+            if not function_calls and final_text is None and active_tools and retry_count < 1:
+                retry_count += 1
+                ledger.extend(response_to_ledger_items(response))
+                ledger.append(
+                    user_text(
+                        "Your reply was not a valid action JSON object. Retry with exactly one JSON action or final object."
+                    )
+                )
+                continue
+            break
+
         ledger.extend(response_to_ledger_items(response))
         function_calls = extract_function_calls(response)
-        last_text = extract_output_text(response)
+        last_text = extract_final_output_text(response) or extract_output_text(response)
 
-        if function_calls:
-            for call in function_calls:
-                if call.name in registry:
-                    result = registry.execute_response_function_call(call)
-                    state.record_tool_call()
-                    ledger.append(function_call_output(call.call_id, result))
+        if len(function_calls) == 1:
+            call = function_calls[0]
+            if call.name in registry:
+                result = registry.execute_response_function_call(call)
+                state.record_tool_call()
+                ledger.append(function_call_output(call.call_id, result))
             continue
 
         if completion_token in last_text:
@@ -509,6 +623,8 @@ def _run_tool_round(
     max_steps: int = 4,
     system_prompt: str = SYSTEM_PROMPT,
     phase_hint: str | None = "implementation",
+    fixed_route: RouteDecision | None = None,
+    exposed_tool_names: set[str] | None = None,
 ) -> tuple[bool, str]:
     ok, _, last_text = execute_agent_loop(
         config=config,
@@ -521,6 +637,8 @@ def _run_tool_round(
         continue_instruction=f"如果还未完成，请继续并在完成后输出 {completion_token}。",
         system_prompt=system_prompt,
         phase_hint=phase_hint,
+        fixed_route=fixed_route,
+        exposed_tool_names=exposed_tool_names,
     )
     return ok, last_text
 
@@ -569,7 +687,7 @@ def run_provider_health_check(config: RunnerConfig) -> int:
         return 1
 
     _prepare_session_logs(config)
-    client = ResponsesClient(config.endpoint)
+    client = ResponsesClient(config.endpoint, config.responses, config.fallback_provider)
     llm_logger = LLMCallLogger(config.llm_log_path)
     tool_logger = ToolCallLogger(config.tool_log_path)
     state = AgentState(config.budget)
@@ -614,6 +732,13 @@ def run_provider_health_check(config: RunnerConfig) -> int:
         registry=live_registry,
         client=client,
         completion_token="PROVIDER_HEALTH_CHECK_COMPLETE",
+        fixed_route=RouteDecision(
+            profile="coder",
+            phase="implementation",
+            enable_hosted_tools=False,
+            reason="provider health check fixed single-tool route",
+        ),
+        exposed_tool_names={"echo_tool"},
     )
     if not echo_ok:
         print(f"FAIL echo_tool_call: {echo_text}")
@@ -634,6 +759,13 @@ def run_provider_health_check(config: RunnerConfig) -> int:
         registry=live_registry,
         client=client,
         completion_token="PROVIDER_HEALTH_CHECK_COMPLETE",
+        fixed_route=RouteDecision(
+            profile="coder",
+            phase="implementation",
+            enable_hosted_tools=False,
+            reason="provider health check fixed single-tool route",
+        ),
+        exposed_tool_names={"write_file"},
     )
     if not write_ok:
         print(f"FAIL write_file_tool_call: {write_text}")
