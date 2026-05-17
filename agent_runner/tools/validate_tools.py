@@ -11,6 +11,22 @@ import numpy as np
 from . import failure, success
 
 
+def _normalize_logged_path(path_value: object, workspace_root: Path | None) -> str | None:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+
+    candidate = Path(path_value)
+    if workspace_root is None:
+        return candidate.as_posix()
+
+    try:
+        if candidate.is_absolute():
+            return candidate.resolve().relative_to(workspace_root).as_posix()
+        return (workspace_root / candidate).resolve().relative_to(workspace_root).as_posix()
+    except ValueError:
+        return candidate.as_posix()
+
+
 def validate_jsonl_logs(path: str | Path) -> dict:
     path = Path(path)
     if not path.exists():
@@ -46,6 +62,7 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
 
     workspace_root = Path(workspace_root).resolve() if workspace_root is not None else None
     lines = path.read_text(encoding="utf-8").splitlines()
+    write_file_calls_by_path: dict[str, list[str]] = {}
     for index, line in enumerate(lines, start=1):
         if not line.strip():
             return failure("validate_responses_logs", f"Empty line at {index}", path=str(path), line=index)
@@ -79,23 +96,67 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
                         path=str(path),
                         line=index,
                     )
-
-        if workspace_root is not None:
-            submission_code_dir = workspace_root / "submission" / "code"
-            if submission_code_dir.exists():
-                code_files = sorted(path for path in submission_code_dir.rglob("*") if path.is_file())
-                for file_path in code_files:
-                    relative = str(file_path.relative_to(workspace_root))
-                    matched = any(
-                        tool_call.get("name") == "write_file" and tool_call.get("arguments", {}).get("path") == relative
-                        for tool_call in tool_calls
+                normalized_path = _normalize_logged_path(arguments.get("path"), workspace_root)
+                if normalized_path is None:
+                    return failure(
+                        "validate_responses_logs",
+                        f"write_file call missing path at line {index}",
+                        path=str(path),
+                        line=index,
                     )
-                    if matched:
-                        break
-                else:
-                    pass
+                content = arguments.get("content")
+                if not isinstance(content, str):
+                    return failure(
+                        "validate_responses_logs",
+                        f"write_file content must be a string at line {index}",
+                        path=str(path),
+                        line=index,
+                    )
+                write_file_calls_by_path.setdefault(normalized_path, []).append(content)
 
-    return success("validate_responses_logs", f"Validated {len(lines)} Responses log lines", path=str(path), lines=len(lines))
+    traced_write_paths: list[str] = []
+    if workspace_root is not None:
+        submission_code_dir = workspace_root / "submission" / "code"
+        if submission_code_dir.exists():
+            untraced_files: list[str] = []
+            content_mismatch_files: list[str] = []
+            for file_path in sorted(candidate for candidate in submission_code_dir.rglob("*") if candidate.is_file()):
+                relative = file_path.relative_to(workspace_root).as_posix()
+                actual_content = file_path.read_text(encoding="utf-8")
+                logged_contents = write_file_calls_by_path.get(relative, [])
+                if not logged_contents:
+                    untraced_files.append(relative)
+                    continue
+                if actual_content not in logged_contents:
+                    content_mismatch_files.append(relative)
+                    continue
+                traced_write_paths.append(relative)
+
+            if untraced_files or content_mismatch_files:
+                problems: list[str] = []
+                if untraced_files:
+                    problems.append(f"Untraced submission/code files: {', '.join(untraced_files)}")
+                if content_mismatch_files:
+                    problems.append(f"write_file content mismatch for: {', '.join(content_mismatch_files)}")
+                return failure(
+                    "validate_responses_logs",
+                    "; ".join(problems),
+                    path=str(path),
+                    lines=len(lines),
+                    traced_write_paths=traced_write_paths,
+                    untraced_files=untraced_files,
+                    content_mismatch_files=content_mismatch_files,
+                    logged_write_paths=sorted(write_file_calls_by_path),
+                )
+
+    return success(
+        "validate_responses_logs",
+        f"Validated {len(lines)} Responses log lines",
+        path=str(path),
+        lines=len(lines),
+        traced_write_paths=traced_write_paths,
+        logged_write_paths=sorted(write_file_calls_by_path),
+    )
 
 
 def _first_dataset(handle: h5py.File) -> h5py.Dataset:
