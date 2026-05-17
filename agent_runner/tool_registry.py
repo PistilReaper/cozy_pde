@@ -12,6 +12,7 @@ from .research_cache import ResearchCache
 from .safety import WorkspaceSafety
 from .responses_items import ResponsesFunctionCall
 from .tools import failure
+from .tools.document_tools import generate_methodology_pdf
 from .tools.fs_tools import list_files, read_file, write_file
 from .tools.hdf5_tools import inspect_hdf5
 from .tools.log_tools import analyze_log
@@ -275,19 +276,17 @@ def build_tool_registry(
             rehearsal_mode=rehearsal_mode,
         )
 
-    def package_submission_tool(submission_dir: str = "submission", test_hdf5: str | None = None) -> dict[str, Any]:
+    def package_submission_tool(submission_dir: str = "submission") -> dict[str, Any]:
         dir_check = safety.validate_read_path(submission_dir)
         if not dir_check.ok:
             return failure("package_submission", dir_check.error or "submission path rejected", submission_dir=submission_dir)
         assert dir_check.resolved_path is not None
-        test_path: str | Path | None = None
-        if test_hdf5 is not None:
-            test_check = safety.validate_read_path(test_hdf5)
-            if not test_check.ok:
-                return failure("package_submission", test_check.error or "test HDF5 rejected", test_hdf5=test_hdf5)
-            assert test_check.resolved_path is not None
-            test_path = test_check.resolved_path
-        return package_submission(submission_dir=dir_check.resolved_path, test_hdf5=test_path)
+        return package_submission(
+            submission_dir=dir_check.resolved_path,
+            workspace_root=config.workspace_root,
+            task_configs=config.submission_task_list,
+            code_dir=config.submission_code_dir,
+        )
 
     def validate_full_submission_tool(
         submission_dir: str = "submission",
@@ -474,9 +473,27 @@ def build_tool_registry(
             description="Validate bundle files, create manifest.json, and build submission.zip under workspace/submission.",
             parameters={
                 "type": "object",
-                "properties": {"submission_dir": {"type": "string", "default": "submission"}, "test_hdf5": {"type": "string"}},
+                "properties": {"submission_dir": {"type": "string", "default": "submission"}},
             },
             handler=package_submission_tool,
+            allowed_phases={"validation", "finalization"},
+        ),
+        ToolDefinition(
+            name="generate_methodology_pdf",
+            description="Generate a simple local methodology.pdf from markdown or plain text.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "path": {"type": "string", "default": "submission/methodology.pdf"},
+                },
+                "required": ["content"],
+            },
+            handler=lambda content, path="submission/methodology.pdf": generate_methodology_pdf(
+                content=content,
+                path=path,
+                safety=safety,
+            ),
             allowed_phases={"validation", "finalization"},
         ),
         ToolDefinition(

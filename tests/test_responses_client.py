@@ -4,8 +4,13 @@ import sys
 import types
 
 from agent_runner.config import FallbackProviderConfig, LLMProfile, OpenAIEndpointConfig
+from agent_runner.json_action_client import JsonActionClient
 from agent_runner.responses_client import ResponsesClient
 from agent_runner.responses_items import user_text
+
+
+def test_responses_client_aliases_json_action_client():
+    assert ResponsesClient is JsonActionClient
 
 
 def test_responses_client_uses_chat_completions_and_normalizes_text_output(monkeypatch):

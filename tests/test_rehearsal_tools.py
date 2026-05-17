@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -53,6 +54,104 @@ def test_rehearsal_profile_accepts_smoke_train_command(workspace):
 
     assert result["ok"] is True
     assert result["data"]["returncode"] == 0
+
+
+def test_run_shell_rejects_submission_code_mutation_and_restores_tree(workspace):
+    config = RunnerConfig.from_workspace(workspace)
+    registry = build_tool_registry(
+        config,
+        ToolCallLogger(workspace / "internal_logs" / "tool_calls.jsonl"),
+    )
+    original_path = workspace / "submission" / "code" / "safe.py"
+    original_path.write_text("print('safe')\n", encoding="utf-8")
+    script_path = workspace / "runs" / "mutate_code.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "target = Path('submission/code/unsafe.py')",
+                "target.write_text(\"print('unsafe')\\n\", encoding='utf-8')",
+                "print('mutated submission code')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = registry.execute(
+        "run_shell",
+        {
+            "command": "python3 runs/mutate_code.py",
+            "timeout_seconds": 30,
+        },
+    )
+
+    assert result["ok"] is False
+    assert "submission/code" in result["error"].lower()
+    assert not (workspace / "submission" / "code" / "unsafe.py").exists()
+    assert original_path.read_text(encoding="utf-8") == "print('safe')\n"
+
+
+def test_run_shell_sanitizes_secret_env_and_redacts_output(workspace, monkeypatch):
+    config = RunnerConfig.from_workspace(workspace)
+    registry = build_tool_registry(
+        config,
+        ToolCallLogger(workspace / "internal_logs" / "tool_calls.jsonl"),
+    )
+    monkeypatch.setenv("MY_API_KEY", "sk-secretvalue123456789012345")
+    script_path = workspace / "runs" / "print_env.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "import os",
+                "print(os.getenv('MY_API_KEY', 'missing'))",
+                "print('Authorization: Bearer sk-secretvalue123456789012345')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = registry.execute(
+        "run_shell",
+        {
+            "command": "python3 runs/print_env.py",
+            "timeout_seconds": 30,
+        },
+    )
+
+    assert result["ok"] is True
+    stdout_tail = result["data"]["stdout_tail"]
+    assert "missing" in stdout_tail
+    assert "sk-secretvalue123456789012345" not in stdout_tail
+    assert "REDACTED" in stdout_tail
+    log_text = (Path(result["data"]["log_path"])).read_text(encoding="utf-8")
+    assert "sk-secretvalue123456789012345" not in log_text
+
+
+def test_run_shell_blocks_direct_download_paths(workspace):
+    config = RunnerConfig.from_workspace(workspace)
+    registry = build_tool_registry(
+        config,
+        ToolCallLogger(workspace / "internal_logs" / "tool_calls.jsonl"),
+    )
+
+    commands = [
+        "git clone https://github.com/example/repo.git",
+        "huggingface-cli download repo/model",
+        "kaggle datasets download foo/bar",
+        "gdown https://drive.google.com/file/d/123/view",
+        "aria2c https://example.com/model.pt",
+        "pip install https://example.com/pkg.whl",
+        "pip install git+https://github.com/example/repo.git",
+        "python -c \"import requests; requests.get('https://example.com')\"",
+        "python -c \"import urllib.request; urllib.request.urlopen('https://example.com')\"",
+        "python -c \"import torch; torch.hub.load('repo', 'model')\"",
+    ]
+
+    for command in commands:
+        result = registry.execute("run_shell", {"command": command})
+        assert result["ok"] is False, command
 
 
 def test_write_file_updates_code_manifest_for_submission_code(workspace):

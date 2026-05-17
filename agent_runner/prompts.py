@@ -44,7 +44,7 @@ REHEARSAL_PROMPT = """你现在处于 autonomous_rehearsal 模式，不是正式
 14. 每个响应最多只能调用一个 function tool；如果需要多个操作，必须分多轮串行调用。
 """
 
-TEST_TOOL_LOOP_PROMPT = """请调用 write_file，在 workspace/submission/code/hello.py 写入一个最小 Python 文件。
+TEST_TOOL_LOOP_PROMPT = """请调用 write_file，在 submission/code/hello.py 写入一个最小 Python 文件。
 收到工具结果后，简短总结是否成功。"""
 
 
@@ -76,14 +76,14 @@ def build_autonomous_dry_run_prompt(*, tasks: list[str], docs_context: str, base
 
 允许动作：
 1. read_file 读取 docs/ 下文档；
-2. list_files 查看 workspace/data、workspace/checkpoints、workspace/baselines；
-3. inspect_hdf5 检查 workspace/data 中已有 hdf5；
-4. write_file 仅写 workspace/runs/autonomous_dry_run/plan.md；
+2. list_files 查看 data、checkpoints、baselines；
+3. inspect_hdf5 检查 data 中已有 hdf5；
+4. write_file 仅写 runs/autonomous_dry_run/plan.md；
 5. 总结正式 autonomous run 的下一步计划。
 
 禁止动作：
 1. run_shell 启动训练或推理；
-2. 写 workspace/submission/code；
+2. 写 submission/code；
 3. 写任何 task prediction 或 time.csv；
 4. 下载外部数据；
 5. 调用任何数值求解器；
@@ -115,17 +115,17 @@ def build_autonomous_rehearsal_prompt(
 每个任务的 smoke 训练预算上限：{max_train_seconds_per_task} 秒
 
 这是 rehearsal，不允许长时间训练。
-如果 workspace/data 中没有可用 HDF5 文件，直接走“最小代码骨架 + 数据缺失报告”路径，不要伪造训练数据。
+如果 data 中没有可用 HDF5 文件，直接走“最小代码骨架 + 数据缺失报告”路径，不要伪造训练数据。
 允许动作：
 1. read_file 读取 docs/ 下文档；
-2. list_files 查看 workspace/data、workspace/checkpoints、workspace/baselines；
+2. list_files 查看 data、checkpoints、baselines；
 3. inspect_hdf5 检查已有 hdf5；
 4. write_file 生成 submission/code 中训练、推理、验证代码；
 5. run_shell 仅执行 smoke train / smoke inference；
 6. validate_submission 检查临时或正式格式；
 7. analyze_log 读取训练日志并修复；
 8. snapshot / rollback 保护稳定版本；
-9. 在 workspace/runs/rehearsal 里写临时 prediction 与 report。
+9. 在 runs/rehearsal 里写临时 prediction 与 report。
 
 禁止动作：
 1. 长时间训练；

@@ -59,8 +59,22 @@ fallback_provider:
   flash_model_env: "DEEPSEEK_FLASH_MODEL"
 
 responses:
+  # JsonActionClient only asks the provider for strict JSON actions.
+  # All filesystem, shell, and network side effects stay in local tools.
   max_tool_calls_per_turn: 1
   retry_on_multi_tool_failure: true
+
+submission_tasks:
+  task1:
+    pred_filename: task1_pred.hdf5
+    time_filename: task1_time.csv
+    logs_filename: task1_logs.log
+    test_hdf5: data/task1_test.hdf5
+  task2:
+    pred_filename: task2_pred.hdf5
+    time_filename: task2_time.csv
+    logs_filename: task2_logs.log
+    test_hdf5: data/task2_test.hdf5
 
 responses_tools:
   enable_web_search: false

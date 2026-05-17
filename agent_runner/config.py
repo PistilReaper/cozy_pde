@@ -88,6 +88,25 @@ def _default_profiles() -> dict[str, "LLMProfile"]:
     }
 
 
+def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
+    return {
+        "task1": SubmissionTaskConfig(
+            name="task1",
+            pred_filename="task1_pred.hdf5",
+            time_filename="task1_time.csv",
+            logs_filename="task1_logs.log",
+            test_hdf5="data/task1_test.hdf5",
+        ),
+        "task2": SubmissionTaskConfig(
+            name="task2",
+            pred_filename="task2_pred.hdf5",
+            time_filename="task2_time.csv",
+            logs_filename="task2_logs.log",
+            test_hdf5="data/task2_test.hdf5",
+        ),
+    }
+
+
 @dataclass(slots=True)
 class OpenAIEndpointConfig:
     provider: str = "third_party_openai_compatible"
@@ -157,6 +176,27 @@ class FallbackProviderConfig:
             pro_model=os.getenv(pro_model_env),
             flash_model_env=flash_model_env,
             flash_model=os.getenv(flash_model_env),
+        )
+
+
+@dataclass(slots=True)
+class SubmissionTaskConfig:
+    name: str
+    pred_filename: str
+    time_filename: str
+    logs_filename: str
+    test_hdf5: str
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict[str, Any] | None) -> "SubmissionTaskConfig":
+        data = data or {}
+        defaults = _default_submission_tasks()[name]
+        return cls(
+            name=name,
+            pred_filename=str(data.get("pred_filename", defaults.pred_filename)),
+            time_filename=str(data.get("time_filename", defaults.time_filename)),
+            logs_filename=str(data.get("logs_filename", defaults.logs_filename)),
+            test_hdf5=str(data.get("test_hdf5", defaults.test_hdf5)),
         )
 
 
@@ -455,6 +495,7 @@ class RunnerConfig:
     fallback_provider: FallbackProviderConfig = field(default_factory=FallbackProviderConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     llm_profiles: dict[str, LLMProfile] = field(default_factory=_default_profiles)
+    submission_tasks: dict[str, SubmissionTaskConfig] = field(default_factory=_default_submission_tasks)
     responses: ResponsesRuntimeConfig = field(default_factory=ResponsesRuntimeConfig)
     responses_tools: ResponsesToolConfig = field(default_factory=ResponsesToolConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
@@ -467,6 +508,7 @@ class RunnerConfig:
         self.endpoint.resolve_env()
         self.fallback_provider.resolve_env()
         self.llm_profiles = dict(self.llm_profiles)
+        self.submission_tasks = dict(self.submission_tasks)
         self._validate_profile_set()
         self.research.resolve_paths(self.project_root)
         if self.shell_log_dir is None:
@@ -492,6 +534,10 @@ class RunnerConfig:
     @property
     def submission_code_dir(self) -> Path:
         return self.submission_dir / "code"
+
+    @property
+    def submission_task_list(self) -> list[SubmissionTaskConfig]:
+        return [self.submission_tasks[name] for name in sorted(self.submission_tasks)]
 
     @property
     def router_profile(self) -> LLMProfile:
@@ -547,6 +593,11 @@ def load_config(config_path: str | Path, workspace_override: str | Path | None =
     llm_profiles: dict[str, LLMProfile] = {}
     for name in REQUIRED_PROFILE_NAMES:
         llm_profiles[name] = LLMProfile.from_dict(name, llm_profiles_raw.get(name, asdict(default_profiles[name])))
+    submission_tasks_raw = raw.get("submission_tasks") or {}
+    default_submission_tasks = _default_submission_tasks()
+    submission_tasks: dict[str, SubmissionTaskConfig] = {}
+    for name in default_submission_tasks:
+        submission_tasks[name] = SubmissionTaskConfig.from_dict(name, submission_tasks_raw.get(name, asdict(default_submission_tasks[name])))
 
     config = RunnerConfig(
         project_root=project_root,
@@ -555,6 +606,7 @@ def load_config(config_path: str | Path, workspace_override: str | Path | None =
         fallback_provider=FallbackProviderConfig.from_dict(raw.get("fallback_provider")),
         router=RouterConfig.from_dict(raw.get("router")),
         llm_profiles=llm_profiles,
+        submission_tasks=submission_tasks,
         responses=ResponsesRuntimeConfig.from_dict(raw.get("responses")),
         responses_tools=ResponsesToolConfig.from_dict(raw.get("responses_tools")),
         research=ResearchConfig.from_dict(raw.get("research")),

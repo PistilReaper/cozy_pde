@@ -5,8 +5,9 @@ import json
 import zipfile
 from pathlib import Path
 
+from ..config import SubmissionTaskConfig, _default_submission_tasks
 from . import failure, success
-from .validate_tools import validate_submission
+from .validate_tools import validate_task_submission_bundles
 
 
 def _sha256_file(path: Path) -> str:
@@ -17,17 +18,13 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _discover_bundles(submission_dir: Path) -> list[tuple[str, str, str]]:
-    bundles: list[tuple[str, str, str]] = []
-    if (submission_dir / "pred.hdf5").exists():
-        bundles.append(("pred.hdf5", "time.csv", "logs.log"))
-    for pred in sorted(submission_dir.glob("task*_pred.hdf5")):
-        prefix = pred.name.removesuffix("_pred.hdf5")
-        bundles.append((pred.name, f"{prefix}_time.csv", f"{prefix}_logs.log"))
-    return bundles
-
-
-def package_submission(*, submission_dir: str | Path, test_hdf5: str | Path | None = None) -> dict:
+def package_submission(
+    *,
+    submission_dir: str | Path,
+    workspace_root: str | Path | None = None,
+    task_configs: list[SubmissionTaskConfig] | None = None,
+    code_dir: str | Path | None = None,
+) -> dict:
     submission_dir = Path(submission_dir)
     if not submission_dir.exists():
         return failure("package_submission", "Submission directory does not exist", submission_dir=str(submission_dir))
@@ -36,26 +33,22 @@ def package_submission(*, submission_dir: str | Path, test_hdf5: str | Path | No
     if not submission_json.exists():
         return failure("package_submission", "submission.json does not exist", path=str(submission_json))
 
-    bundles = _discover_bundles(submission_dir)
-    if not bundles:
-        return failure("package_submission", "No prediction bundles found", submission_dir=str(submission_dir))
+    methodology_path = submission_dir / "methodology.pdf"
+    if not methodology_path.exists():
+        return failure("package_submission", "methodology.pdf is required", path=str(methodology_path))
 
-    validations = []
-    for pred_name, time_name, log_name in bundles:
-        result = validate_submission(
-            submission_dir=submission_dir,
-            test_hdf5=test_hdf5,
-            pred_filename=pred_name,
-            time_filename=time_name,
-            logs_filename=log_name,
-        )
-        validations.append(result)
+    resolved_workspace_root = Path(workspace_root) if workspace_root is not None else submission_dir.parent
+    resolved_task_configs = task_configs or list(_default_submission_tasks().values())
+    validations = validate_task_submission_bundles(
+        submission_dir=submission_dir,
+        task_configs=resolved_task_configs,
+        workspace_root=resolved_workspace_root,
+        code_dir=code_dir,
+        rehearsal_mode=False,
+    )
+    for result in validations:
         if not result["ok"]:
             return failure("package_submission", result["error"], validation=result)
-
-    warnings: list[str] = []
-    if not (submission_dir / "methodology.pdf").exists():
-        warnings.append("methodology.pdf is missing")
 
     manifest_entries = []
     for file_path in sorted(path for path in submission_dir.rglob("*") if path.is_file() and path.name != "submission.zip"):
@@ -80,8 +73,7 @@ def package_submission(*, submission_dir: str | Path, test_hdf5: str | Path | No
         f"Packaged submission with {len(manifest_entries)} files",
         zip_path=str(zip_path),
         manifest_path=str(manifest_path),
-        warnings=warnings,
-        bundles=[bundle[0] for bundle in bundles],
+        warnings=[],
+        bundles=[task_config.name for task_config in resolved_task_configs],
         validations=validations,
     )
-

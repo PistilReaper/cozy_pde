@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 @dataclass(slots=True)
@@ -34,6 +35,18 @@ class WorkspaceSafety:
         "simulate_extra",
         "download_dataset",
     )
+    _FORBIDDEN_COMMAND_PATTERNS = (
+        re.compile(r"(^|\s)git\s+clone(\s|$)"),
+        re.compile(r"(^|\s)huggingface-cli(\s|$)"),
+        re.compile(r"(^|\s)kaggle(\s|$)"),
+        re.compile(r"(^|\s)gdown(\s|$)"),
+        re.compile(r"(^|\s)aria2c(\s|$)"),
+        re.compile(r"(^|\s)(python(\d+(\.\d+)?)?\s+-m\s+)?pip\s+install\s+https?://"),
+        re.compile(r"(^|\s)(python(\d+(\.\d+)?)?\s+-m\s+)?pip\s+install\s+git\+"),
+        re.compile(r"python[0-9.\s-]*-c\s+[\"'][^\"']*requests\.get"),
+        re.compile(r"python[0-9.\s-]*-c\s+[\"'][^\"']*urllib\.request"),
+        re.compile(r"torch\.hub\.load"),
+    )
 
     def __init__(
         self,
@@ -51,8 +64,15 @@ class WorkspaceSafety:
         self.allowed_write_roots = tuple(Path(root).resolve() for root in (allowed_write_roots or default_write_roots))
         self.extra_read_roots = tuple(Path(root).resolve() for root in (extra_read_roots or ()))
 
-    def resolve_path(self, path: str | Path) -> SafetyCheck:
+    @staticmethod
+    def _normalize_workspace_prefixed_path(path: str | Path) -> Path:
         candidate = Path(path)
+        if candidate.parts and candidate.parts[0] == "workspace":
+            return Path(*candidate.parts[1:])
+        return candidate
+
+    def resolve_path(self, path: str | Path) -> SafetyCheck:
+        candidate = self._normalize_workspace_prefixed_path(path)
         allowed_roots = (self.workspace_root, *self.extra_read_roots)
         if candidate.is_absolute():
             resolved_candidates = [candidate.resolve()]
@@ -109,6 +129,9 @@ class WorkspaceSafety:
         for fragment in self._FORBIDDEN_COMMAND_FRAGMENTS:
             if fragment in normalized:
                 return SafetyCheck(ok=False, error=f"Command contains forbidden fragment: {fragment}")
+        for pattern in self._FORBIDDEN_COMMAND_PATTERNS:
+            if pattern.search(normalized):
+                return SafetyCheck(ok=False, error=f"Command matches forbidden pattern: {pattern.pattern}")
         return SafetyCheck(ok=True)
 
     @staticmethod

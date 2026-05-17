@@ -41,3 +41,19 @@ def test_read_file_rejects_sensitive_paths(workspace):
 
     assert result["ok"] is False
     assert "sensitive" in result["error"].lower()
+
+
+def test_workspace_prefixed_paths_are_normalized(workspace):
+    safety = WorkspaceSafety(workspace)
+
+    write_result = write_file(
+        path="workspace/submission/code/normalized.py",
+        content="print('normalized')\n",
+        safety=safety,
+    )
+    assert write_result["ok"] is True
+    assert write_result["data"]["path"].endswith("submission/code/normalized.py")
+
+    read_result = read_file(path="workspace/submission/code/normalized.py", safety=safety)
+    assert read_result["ok"] is True
+    assert "normalized" in read_result["data"]["content"]

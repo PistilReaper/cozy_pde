@@ -8,6 +8,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from ..config import SubmissionTaskConfig
 from . import failure, success
 
 
@@ -16,6 +17,8 @@ def _normalize_logged_path(path_value: object, workspace_root: Path | None) -> s
         return None
 
     candidate = Path(path_value)
+    if candidate.parts and candidate.parts[0] == "workspace":
+        candidate = Path(*candidate.parts[1:])
     if workspace_root is None:
         return candidate.as_posix()
 
@@ -260,3 +263,30 @@ def validate_submission(
         logs_path=str(logs_path),
         rehearsal_only=rehearsal_only,
     )
+
+
+def validate_task_submission_bundles(
+    *,
+    submission_dir: str | Path,
+    task_configs: list[SubmissionTaskConfig],
+    workspace_root: str | Path,
+    code_dir: str | Path | None = None,
+    rehearsal_mode: bool = False,
+) -> list[dict]:
+    submission_dir = Path(submission_dir)
+    workspace_root = Path(workspace_root)
+    validations: list[dict] = []
+    for task_config in task_configs:
+        test_hdf5 = workspace_root / task_config.test_hdf5
+        validations.append(
+            validate_submission(
+                submission_dir=submission_dir,
+                test_hdf5=test_hdf5,
+                pred_filename=task_config.pred_filename,
+                time_filename=task_config.time_filename,
+                logs_filename=task_config.logs_filename,
+                code_dir=code_dir,
+                rehearsal_mode=rehearsal_mode,
+            )
+        )
+    return validations

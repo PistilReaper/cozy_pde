@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import time
 from dataclasses import replace
@@ -25,7 +26,7 @@ from .prompts import (
     build_autonomous_rehearsal_prompt,
     build_autonomous_user_prompt,
 )
-from .responses_client import ResponsesClient
+from .json_action_client import JsonActionClient
 from .responses_items import (
     extract_final_output_text,
     extract_function_calls,
@@ -41,7 +42,7 @@ from .state import AgentState
 from .tool_registry import ToolDefinition, ToolRegistry, build_tool_registry
 from .tools import failure, success
 from .tools.research_tools import fetch_pdf, fetch_url, parse_pdf, search_arxiv, search_github, web_search
-from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs
+from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs, validate_submission
 
 SECRET_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b", re.IGNORECASE),
@@ -414,7 +415,7 @@ def run_preflight(config: RunnerConfig) -> int:
 
 def _call_model(
     *,
-    client: ResponsesClient,
+    client: JsonActionClient,
     llm_logger: LLMCallLogger,
     ledger: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -468,7 +469,7 @@ def execute_agent_loop(
     task_id: str,
     max_steps: int,
     registry: ToolRegistry | None = None,
-    client: ResponsesClient | None = None,
+    client: JsonActionClient | None = None,
     completion_token: str = "RUNNER_FINALIZED",
     continue_instruction: str = "继续 autonomous loop。需要具体动作时必须调用工具；只有在校验和打包完成后才能输出 RUNNER_FINALIZED。",
     system_prompt: str = SYSTEM_PROMPT,
@@ -476,7 +477,7 @@ def execute_agent_loop(
     fixed_route: RouteDecision | None = None,
     exposed_tool_names: set[str] | None = None,
 ) -> tuple[bool, list[dict[str, Any]], str]:
-    client = client or ResponsesClient(config.endpoint, config.responses, config.fallback_provider)
+    client = client or JsonActionClient(config.endpoint, config.responses, config.fallback_provider)
     llm_logger = LLMCallLogger(config.llm_log_path)
     tool_logger = ToolCallLogger(config.tool_log_path)
     registry = registry or build_tool_registry(
@@ -618,7 +619,7 @@ def _run_tool_round(
     task_id: str,
     items: list[dict[str, Any]],
     registry: ToolRegistry,
-    client: ResponsesClient,
+    client: JsonActionClient,
     completion_token: str,
     max_steps: int = 4,
     system_prompt: str = SYSTEM_PROMPT,
@@ -661,7 +662,7 @@ def run_test_tool_loop(config: RunnerConfig) -> int:
     )
 
     if not (config.submission_code_dir / "hello.py").exists():
-        print("FAIL hello.py was not created under workspace/submission/code")
+        print("FAIL hello.py was not created under submission/code")
         return 1
 
     llm_log_result = validate_jsonl_logs(config.llm_log_path)
@@ -687,7 +688,7 @@ def run_provider_health_check(config: RunnerConfig) -> int:
         return 1
 
     _prepare_session_logs(config)
-    client = ResponsesClient(config.endpoint, config.responses, config.fallback_provider)
+    client = JsonActionClient(config.endpoint, config.responses, config.fallback_provider)
     llm_logger = LLMCallLogger(config.llm_log_path)
     tool_logger = ToolCallLogger(config.tool_log_path)
     state = AgentState(config.budget)
@@ -748,7 +749,7 @@ def run_provider_health_check(config: RunnerConfig) -> int:
     write_items = [
         system_text("You are validating write_file tool-calling. Do not use submission/code."),
         user_text(
-            "Call write_file and write one line of text to workspace/runs/scratch/provider_health_check.txt. "
+            "Call write_file and write one line of text to runs/scratch/provider_health_check.txt. "
             "After the tool result, reply with PROVIDER_HEALTH_CHECK_COMPLETE and a short summary."
         ),
     ]
@@ -1035,7 +1036,7 @@ def run_autonomous_dry_run(config: RunnerConfig, tasks: list[str], max_steps: in
         registry=registry,
         completion_token="DRY_RUN_COMPLETE",
         continue_instruction=(
-            "继续 dry-run。只能读取 docs 和 workspace 内容，允许把计划写入 workspace/runs/autonomous_dry_run/plan.md，"
+            "继续 dry-run。只能读取 docs 和 workspace 内容，允许把计划写入 runs/autonomous_dry_run/plan.md，"
             "禁止 run_shell 和 submission/code 写入。完成后输出 DRY_RUN_COMPLETE。"
         ),
         phase_hint="planning",
@@ -1207,7 +1208,6 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
     checks: list[str] = []
     warnings: list[str] = []
     failures: list[str] = []
-    test_hdf5 = _find_test_hdf5(config)
 
     llm_log_result = validate_jsonl_logs(config.llm_log_path)
     if llm_log_result["ok"]:
@@ -1242,55 +1242,39 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
     else:
         warnings.append("WARN submission/code is empty")
 
-    for task in ["task1", "task2"]:
-        pred_path = config.submission_dir / f"{task}_pred.hdf5"
-        time_path = config.submission_dir / f"{task}_time.csv"
-        logs_path = config.submission_dir / f"{task}_logs.log"
+    methodology_path = config.submission_dir / "methodology.pdf"
+    if methodology_path.exists():
+        checks.append("PASS methodology.pdf exists")
+    elif strict:
+        failures.append("FAIL methodology.pdf missing")
+    else:
+        warnings.append("WARN methodology.pdf missing")
+
+    for task_config in config.submission_task_list:
+        pred_path = config.submission_dir / task_config.pred_filename
+        time_path = config.submission_dir / task_config.time_filename
+        logs_path = config.submission_dir / task_config.logs_filename
         any_exists = any(path.exists() for path in [pred_path, time_path, logs_path])
         if not any_exists:
             if strict:
-                failures.append(f"FAIL {task} bundle missing")
+                failures.append(f"FAIL {task_config.name} bundle missing")
             else:
-                warnings.append(f"WARN {task} bundle missing")
+                warnings.append(f"WARN {task_config.name} bundle missing")
             continue
 
-        if logs_path.exists():
-            log_result = validate_jsonl_logs(logs_path)
-            if log_result["ok"]:
-                checks.append(f"PASS {task} logs JSONL")
-            else:
-                failures.append(f"FAIL {task} logs JSONL: {log_result['error']}")
-        elif strict:
-            failures.append(f"FAIL {task} logs missing")
+        result = validate_submission(
+            submission_dir=config.submission_dir,
+            test_hdf5=config.workspace_root / task_config.test_hdf5,
+            pred_filename=task_config.pred_filename,
+            time_filename=task_config.time_filename,
+            logs_filename=task_config.logs_filename,
+            code_dir=config.submission_code_dir,
+            rehearsal_mode=False,
+        )
+        if result["ok"]:
+            checks.append(f"PASS {task_config.name} bundle")
         else:
-            warnings.append(f"WARN {task} logs missing")
-
-        if time_path.exists():
-            time_ok, time_error = _validate_time_csv(time_path)
-            if time_ok:
-                checks.append(f"PASS {task} time.csv")
-            else:
-                failures.append(f"FAIL {task} time.csv: {time_error}")
-        elif strict:
-            failures.append(f"FAIL {task} time.csv missing")
-        else:
-            warnings.append(f"WARN {task} time.csv missing")
-
-        if pred_path.exists():
-            pred_ok, pred_error, pred_shape = _read_prediction_shape(pred_path)
-            if pred_ok:
-                checks.append(f"PASS {task} pred shape {tuple(pred_shape or [])}")
-                first_ten_ok, first_ten_error = _check_first_ten_steps(pred_path, test_hdf5)
-                if first_ten_ok:
-                    checks.append(f"PASS {task} initial condition")
-                else:
-                    failures.append(f"FAIL {task} initial condition: {first_ten_error}")
-            else:
-                failures.append(f"FAIL {task} pred.hdf5: {pred_error}")
-        elif strict:
-            failures.append(f"FAIL {task} pred.hdf5 missing")
-        else:
-            warnings.append(f"WARN {task} pred.hdf5 missing")
+            failures.append(f"FAIL {task_config.name} bundle: {result['error']}")
 
     manifest_path = config.submission_dir / "manifest.json"
     if manifest_path.exists():
@@ -1311,7 +1295,7 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
                 failures.append(f"FAIL code_manifest.json: {issue}")
 
     rehearsal_report = config.workspace_root / "runs" / "rehearsal" / "rehearsal_report.md"
-    if rehearsal_report.exists() and not any((config.submission_dir / f"{task}_pred.hdf5").exists() for task in ["task1", "task2"]):
+    if rehearsal_report.exists() and not any((config.submission_dir / task.pred_filename).exists() for task in config.submission_task_list):
         warnings.append("WARN rehearsal artifacts exist but formal task predictions are not present")
 
     leak_hits = _scan_for_secret_leaks([config.submission_dir, config.workspace_root / "llm_logs"])
@@ -1323,6 +1307,69 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
 
     _print_lines(checks + warnings + failures)
     return 0 if not failures else 1
+
+
+def run_readiness_check(
+    config: RunnerConfig,
+    *,
+    tasks: list[str],
+    max_steps: int | None,
+    max_train_seconds_per_task: int,
+) -> int:
+    report_dir = config.workspace_root / "runs" / "readiness_check"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stage_results: list[dict[str, object]] = []
+
+    def record(name: str, exit_code: int, detail: str | None = None) -> None:
+        stage_results.append(
+            {
+                "name": name,
+                "exit_code": exit_code,
+                "ok": exit_code == 0,
+                "detail": detail or "",
+            }
+        )
+
+    record("preflight", run_preflight(config))
+
+    pytest_result = subprocess.run(
+        [str(config.project_root / ".venv" / "bin" / "python"), "-m", "pytest", "-q"],
+        cwd=str(config.project_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    record("pytest", pytest_result.returncode, (pytest_result.stdout or pytest_result.stderr).strip())
+
+    record("provider_health_check", run_provider_health_check(config))
+    record("autonomous_dry_run", run_autonomous_dry_run(config, tasks, max_steps or 6))
+    record(
+        "autonomous_rehearsal",
+        run_autonomous_rehearsal(config, tasks, max_steps or 20, max_train_seconds_per_task),
+    )
+    record("final_check", run_final_check(config, strict=True))
+
+    safe_to_start = all(bool(stage["ok"]) for stage in stage_results)
+    report_path = report_dir / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "safe_to_start_full_autonomous_run": safe_to_start,
+                "stages": stage_results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    for stage in stage_results:
+        status = "PASS" if stage["ok"] else "FAIL"
+        detail = f" {stage['detail']}" if stage["detail"] else ""
+        print(f"{status} {stage['name']}{detail}")
+    print(f"READINESS safe_to_start_full_autonomous_run={str(safe_to_start).lower()}")
+    print(f"READINESS report={report_path}")
+    return 0 if safe_to_start else 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1340,6 +1387,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "autonomous_rehearsal",
             "export_task_logs",
             "final_check",
+            "readiness_check",
         ],
     )
     parser.add_argument("--config", required=True)
@@ -1371,6 +1419,13 @@ def main(argv: list[str] | None = None) -> int:
         return run_autonomous_rehearsal(config, tasks, args.max_steps or 20, args.max_train_seconds_per_task)
     if args.mode == "export_task_logs":
         return run_export_task_logs(config, tasks)
+    if args.mode == "readiness_check":
+        return run_readiness_check(
+            config,
+            tasks=tasks,
+            max_steps=args.max_steps,
+            max_train_seconds_per_task=args.max_train_seconds_per_task,
+        )
     return run_final_check(config, strict=args.strict)
 
 

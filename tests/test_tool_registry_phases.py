@@ -63,6 +63,7 @@ def test_phase_tool_narrowing_reduces_available_tools(workspace):
     registry.set_context(task_id="task-final", step_id="step-003", phase="finalization")
     finalization_names = {schema["name"] for schema in registry.response_function_tools()}
     assert finalization_names == {
+        "generate_methodology_pdf",
         "inspect_hdf5",
         "validate_submission",
         "validate_responses_logs",
