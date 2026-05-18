@@ -4,4 +4,6 @@ __pycache__/
 .env
 *.ini
 docs/
+dev_docs/
+workspace/
 *.jsonl
