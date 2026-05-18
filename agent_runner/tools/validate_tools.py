@@ -212,6 +212,9 @@ def validate_submission(
     logs_filename: str = "logs.log",
     code_dir: str | Path | None = None,
     rehearsal_mode: bool = False,
+    expected_total_steps: int = 200,
+    expected_spatial_points: int = 256,
+    input_steps: int = 10,
 ) -> dict:
     submission_dir = Path(submission_dir)
     pred_path = submission_dir / pred_filename
@@ -231,8 +234,13 @@ def validate_submission(
     except Exception as exc:  # noqa: BLE001
         return failure("validate_submission", f"Failed to read prediction HDF5: {exc}", pred_path=str(pred_path))
 
-    if pred.ndim != 3 or pred.shape[1:] != (200, 256):
-        return failure("validate_submission", f"Prediction shape must be (N, 200, 256), got {pred.shape}", pred_shape=list(pred.shape))
+    expected_suffix = (expected_total_steps, expected_spatial_points)
+    if pred.ndim != 3 or pred.shape[1:] != expected_suffix:
+        return failure(
+            "validate_submission",
+            f"Prediction shape must be (N, {expected_total_steps}, {expected_spatial_points}), got {pred.shape}",
+            pred_shape=list(pred.shape),
+        )
     if np.isnan(pred).any() or np.isinf(pred).any():
         return failure("validate_submission", "Prediction contains NaN or Inf", pred_shape=list(pred.shape))
 
@@ -244,16 +252,25 @@ def validate_submission(
         except Exception as exc:  # noqa: BLE001
             return failure("validate_submission", f"Failed to read test HDF5: {exc}", test_hdf5=str(test_hdf5))
 
-        if test.shape[1] < 10 or test.shape[2] != 256:
+        if test.shape[1] < input_steps or test.shape[2] != expected_spatial_points:
             return failure("validate_submission", "Test HDF5 shape is incompatible with prediction", test_shape=list(test.shape), pred_shape=list(pred.shape))
         if rehearsal_mode and pred.shape[0] <= test.shape[0]:
             rehearsal_only = pred.shape[0] < test.shape[0]
-            if not np.allclose(pred[:, :10, :], test[: pred.shape[0], :10, :], atol=1e-3, rtol=0.0):
-                return failure("validate_submission", "Prediction first 10 steps do not match test input", pred_shape=list(pred.shape), rehearsal_only=True)
+            if not np.allclose(pred[:, :input_steps, :], test[: pred.shape[0], :input_steps, :], atol=1e-3, rtol=0.0):
+                return failure(
+                    "validate_submission",
+                    f"Prediction first {input_steps} steps do not match test input",
+                    pred_shape=list(pred.shape),
+                    rehearsal_only=True,
+                )
         elif test.shape[0] != pred.shape[0]:
             return failure("validate_submission", "Test HDF5 shape is incompatible with prediction", test_shape=list(test.shape), pred_shape=list(pred.shape))
-        elif not np.allclose(pred[:, :10, :], test[:, :10, :], atol=1e-3, rtol=0.0):
-            return failure("validate_submission", "Prediction first 10 steps do not match test input", pred_shape=list(pred.shape))
+        elif not np.allclose(pred[:, :input_steps, :], test[:, :input_steps, :], atol=1e-3, rtol=0.0):
+            return failure(
+                "validate_submission",
+                f"Prediction first {input_steps} steps do not match test input",
+                pred_shape=list(pred.shape),
+            )
 
     time_ok, time_error, time_values = _validate_time_csv(time_path)
     if not time_ok:
@@ -296,6 +313,9 @@ def validate_task_submission_bundles(
                 logs_filename=task_config.logs_filename,
                 code_dir=code_dir,
                 rehearsal_mode=rehearsal_mode,
+                expected_total_steps=task_config.total_steps,
+                expected_spatial_points=task_config.spatial_points,
+                input_steps=task_config.input_steps,
             )
         )
     return validations

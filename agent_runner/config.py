@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +96,9 @@ def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
             time_filename="task1_time.csv",
             logs_filename="task1_logs.log",
             test_hdf5="data/task1_test.hdf5",
+            input_steps=10,
+            total_steps=200,
+            spatial_points=256,
         ),
         "task2": SubmissionTaskConfig(
             name="task2",
@@ -103,6 +106,19 @@ def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
             time_filename="task2_time.csv",
             logs_filename="task2_logs.log",
             test_hdf5="data/task2_test.hdf5",
+            input_steps=10,
+            total_steps=200,
+            spatial_points=256,
+        ),
+        "task3": SubmissionTaskConfig(
+            name="task3",
+            pred_filename="task3_pred.hdf5",
+            time_filename="task3_time.csv",
+            logs_filename="task3_logs.log",
+            test_hdf5="data/task3_test.hdf5",
+            input_steps=20,
+            total_steps=400,
+            spatial_points=256,
         ),
     }
 
@@ -186,6 +202,9 @@ class SubmissionTaskConfig:
     time_filename: str
     logs_filename: str
     test_hdf5: str
+    input_steps: int = 10
+    total_steps: int = 200
+    spatial_points: int = 256
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any] | None) -> "SubmissionTaskConfig":
@@ -197,6 +216,9 @@ class SubmissionTaskConfig:
             time_filename=str(data.get("time_filename", defaults.time_filename)),
             logs_filename=str(data.get("logs_filename", defaults.logs_filename)),
             test_hdf5=str(data.get("test_hdf5", defaults.test_hdf5)),
+            input_steps=int(data.get("input_steps", defaults.input_steps)),
+            total_steps=int(data.get("total_steps", defaults.total_steps)),
+            spatial_points=int(data.get("spatial_points", defaults.spatial_points)),
         )
 
 
@@ -501,6 +523,7 @@ class RunnerConfig:
     research: ResearchConfig = field(default_factory=ResearchConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     shell_log_dir: Path | None = None
+    session_label: str | None = None
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
@@ -512,7 +535,10 @@ class RunnerConfig:
         self._validate_profile_set()
         self.research.resolve_paths(self.project_root)
         if self.shell_log_dir is None:
-            self.shell_log_dir = self.workspace_root / "runs" / "logs"
+            if self.session_label:
+                self.shell_log_dir = self.workspace_root / "runs" / self.session_label / "logs"
+            else:
+                self.shell_log_dir = self.workspace_root / "runs" / "logs"
 
     def _validate_profile_set(self) -> None:
         missing = [name for name in REQUIRED_PROFILE_NAMES if name not in self.llm_profiles]
@@ -521,10 +547,14 @@ class RunnerConfig:
 
     @property
     def llm_log_path(self) -> Path:
+        if self.session_label:
+            return self.workspace_root / "llm_logs" / f"{self.session_label}_all_llm_calls.jsonl"
         return self.workspace_root / "llm_logs" / "all_llm_calls.jsonl"
 
     @property
     def tool_log_path(self) -> Path:
+        if self.session_label:
+            return self.workspace_root / "internal_logs" / f"{self.session_label}_tool_calls.jsonl"
         return self.workspace_root / "internal_logs" / "tool_calls.jsonl"
 
     @property
@@ -538,6 +568,24 @@ class RunnerConfig:
     @property
     def submission_task_list(self) -> list[SubmissionTaskConfig]:
         return [self.submission_tasks[name] for name in sorted(self.submission_tasks)]
+
+    def task_config(self, name: str) -> SubmissionTaskConfig:
+        return self.submission_tasks[name]
+
+    def task_run_dir(self, name: str) -> Path:
+        return self.workspace_root / "runs" / name
+
+    def task_submission_code_dir(self, name: str) -> Path:
+        return self.submission_code_dir / name
+
+    def with_session(self, session_label: str) -> "RunnerConfig":
+        session_config = replace(
+            self,
+            session_label=session_label,
+            shell_log_dir=self.workspace_root / "runs" / session_label / "logs",
+        )
+        session_config.ensure_workspace_dirs()
+        return session_config
 
     @property
     def router_profile(self) -> LLMProfile:
@@ -566,6 +614,8 @@ class RunnerConfig:
             "submission/code",
         ]:
             (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
+        assert self.shell_log_dir is not None
+        self.shell_log_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def from_workspace(cls, workspace_root: str | Path, project_root: str | Path | None = None) -> "RunnerConfig":

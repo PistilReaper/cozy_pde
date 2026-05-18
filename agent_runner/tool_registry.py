@@ -247,6 +247,9 @@ def build_tool_registry(
         logs_filename: str = "logs.log",
         code_dir: str | None = None,
         rehearsal_mode: bool = rehearsal_validation,
+        expected_total_steps: int = 200,
+        expected_spatial_points: int = 256,
+        input_steps: int = 10,
     ) -> dict[str, Any]:
         dir_check = safety.validate_read_path(submission_dir)
         if not dir_check.ok:
@@ -274,6 +277,9 @@ def build_tool_registry(
             logs_filename=logs_filename,
             code_dir=code_path,
             rehearsal_mode=rehearsal_mode,
+            expected_total_steps=expected_total_steps,
+            expected_spatial_points=expected_spatial_points,
+            input_steps=input_steps,
         )
 
     def package_submission_tool(submission_dir: str = "submission") -> dict[str, Any]:
@@ -298,6 +304,9 @@ def build_tool_registry(
         logs_filename: str = "logs.log",
         code_dir: str | None = None,
         rehearsal_mode: bool = rehearsal_validation,
+        expected_total_steps: int = 200,
+        expected_spatial_points: int = 256,
+        input_steps: int = 10,
     ) -> dict[str, Any]:
         submission_result = validate_submission_tool(
             submission_dir=submission_dir,
@@ -307,6 +316,9 @@ def build_tool_registry(
             logs_filename=logs_filename,
             code_dir=code_dir,
             rehearsal_mode=rehearsal_mode,
+            expected_total_steps=expected_total_steps,
+            expected_spatial_points=expected_spatial_points,
+            input_steps=input_steps,
         )
         responses_result = validate_responses_logs_tool(
             path=responses_log_path,
@@ -434,6 +446,9 @@ def build_tool_registry(
                     "logs_filename": {"type": "string", "default": "logs.log"},
                     "code_dir": {"type": "string"},
                     "rehearsal_mode": {"type": "boolean", "default": rehearsal_validation},
+                    "expected_total_steps": {"type": "integer", "default": 200},
+                    "expected_spatial_points": {"type": "integer", "default": 256},
+                    "input_steps": {"type": "integer", "default": 10},
                 },
             },
             handler=validate_submission_tool,
@@ -511,6 +526,9 @@ def build_tool_registry(
                     "logs_filename": {"type": "string", "default": "logs.log"},
                     "code_dir": {"type": "string"},
                     "rehearsal_mode": {"type": "boolean", "default": rehearsal_validation},
+                    "expected_total_steps": {"type": "integer", "default": 200},
+                    "expected_spatial_points": {"type": "integer", "default": 256},
+                    "input_steps": {"type": "integer", "default": 10},
                 },
             },
             handler=validate_full_submission_tool,

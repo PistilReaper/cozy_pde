@@ -18,6 +18,56 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _detect_task_configs(
+    *,
+    submission_dir: Path,
+    task_configs: list[SubmissionTaskConfig],
+) -> list[SubmissionTaskConfig]:
+    detected = [
+        task_config
+        for task_config in task_configs
+        if any(
+            (submission_dir / filename).exists()
+            for filename in (
+                task_config.pred_filename,
+                task_config.time_filename,
+                task_config.logs_filename,
+            )
+        )
+    ]
+    return detected or task_configs
+
+
+def _package_file_paths(
+    *,
+    submission_dir: Path,
+    task_configs: list[SubmissionTaskConfig],
+    code_dir: Path,
+    include_manifest: bool,
+) -> list[Path]:
+    allowed: list[Path] = []
+    for name in ("submission.json", "methodology.pdf", "README.md", "code_manifest.json"):
+        candidate = submission_dir / name
+        if candidate.exists():
+            allowed.append(candidate)
+    if include_manifest:
+        manifest_path = submission_dir / "manifest.json"
+        if manifest_path.exists():
+            allowed.append(manifest_path)
+    for task_config in task_configs:
+        for filename in (
+            task_config.pred_filename,
+            task_config.time_filename,
+            task_config.logs_filename,
+        ):
+            candidate = submission_dir / filename
+            if candidate.exists():
+                allowed.append(candidate)
+    if code_dir.exists():
+        allowed.extend(path for path in sorted(code_dir.rglob("*")) if path.is_file())
+    return sorted(dict.fromkeys(allowed))
+
+
 def package_submission(
     *,
     submission_dir: str | Path,
@@ -38,12 +88,17 @@ def package_submission(
         return failure("package_submission", "methodology.pdf is required", path=str(methodology_path))
 
     resolved_workspace_root = Path(workspace_root) if workspace_root is not None else submission_dir.parent
-    resolved_task_configs = task_configs or list(_default_submission_tasks().values())
+    configured_task_configs = task_configs or list(_default_submission_tasks().values())
+    resolved_task_configs = _detect_task_configs(
+        submission_dir=submission_dir,
+        task_configs=configured_task_configs,
+    )
+    resolved_code_dir = Path(code_dir) if code_dir is not None else submission_dir / "code"
     validations = validate_task_submission_bundles(
         submission_dir=submission_dir,
         task_configs=resolved_task_configs,
         workspace_root=resolved_workspace_root,
-        code_dir=code_dir,
+        code_dir=resolved_code_dir,
         rehearsal_mode=False,
     )
     for result in validations:
@@ -51,7 +106,13 @@ def package_submission(
             return failure("package_submission", result["error"], validation=result)
 
     manifest_entries = []
-    for file_path in sorted(path for path in submission_dir.rglob("*") if path.is_file() and path.name != "submission.zip"):
+    packaged_files = _package_file_paths(
+        submission_dir=submission_dir,
+        task_configs=resolved_task_configs,
+        code_dir=resolved_code_dir,
+        include_manifest=False,
+    )
+    for file_path in packaged_files:
         manifest_entries.append(
             {
                 "path": str(file_path.relative_to(submission_dir)),
@@ -65,7 +126,15 @@ def package_submission(
 
     zip_path = submission_dir / "submission.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for file_path in sorted(path for path in submission_dir.rglob("*") if path.is_file() and path != zip_path):
+        zipped_files = _package_file_paths(
+            submission_dir=submission_dir,
+            task_configs=resolved_task_configs,
+            code_dir=resolved_code_dir,
+            include_manifest=True,
+        )
+        for file_path in zipped_files:
+            if file_path == zip_path:
+                continue
             archive.write(file_path, arcname=str(file_path.relative_to(submission_dir)))
 
     return success(

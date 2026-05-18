@@ -70,11 +70,25 @@ submission_tasks:
     time_filename: task1_time.csv
     logs_filename: task1_logs.log
     test_hdf5: data/task1_test.hdf5
+    input_steps: 10
+    total_steps: 200
+    spatial_points: 256
   task2:
     pred_filename: task2_pred.hdf5
     time_filename: task2_time.csv
     logs_filename: task2_logs.log
     test_hdf5: data/task2_test.hdf5
+    input_steps: 10
+    total_steps: 200
+    spatial_points: 256
+  task3:
+    pred_filename: task3_pred.hdf5
+    time_filename: task3_time.csv
+    logs_filename: task3_logs.log
+    test_hdf5: data/task3_test.hdf5
+    input_steps: 20
+    total_steps: 400
+    spatial_points: 256
 
 responses_tools:
   enable_web_search: false
