@@ -5,9 +5,11 @@ import csv
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -126,6 +128,66 @@ def _read_tool_log_entries(path: Path) -> list[dict[str, Any]]:
             continue
         entries.append(json.loads(line))
     return entries
+
+
+def prepare_run_workspace(config: RunnerConfig, *, run_label: str) -> Path | None:
+    config.ensure_workspace_dirs()
+
+    def has_files(path: Path) -> bool:
+        return path.exists() and any(candidate.is_file() for candidate in path.rglob("*"))
+
+    output_roots = [
+        config.workspace_root / "llm_logs",
+        config.workspace_root / "internal_logs",
+        config.workspace_root / "submission",
+        config.workspace_root / "research",
+    ]
+    runs_dir = config.workspace_root / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    archive_root = runs_dir / "archive"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    runs_children_to_archive = [path for path in runs_dir.iterdir() if path.name != "archive" and has_files(path)]
+    has_archivable_output = any(has_files(path) for path in output_roots) or bool(runs_children_to_archive)
+
+    archive_dir: Path | None = None
+    if has_archivable_output:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_dir = archive_root / f"{timestamp}_{run_label}"
+        archive_dir.mkdir(parents=True, exist_ok=False)
+
+        for source in output_roots:
+            if has_files(source):
+                shutil.move(str(source), str(archive_dir / source.name))
+        archived_runs_dir = archive_dir / "runs"
+        for source in runs_children_to_archive:
+            shutil.move(str(source), str(archived_runs_dir / source.name))
+
+    config.ensure_workspace_dirs()
+    archive_root.mkdir(parents=True, exist_ok=True)
+    return archive_dir
+
+
+def _write_rehearsal_report_if_missing(rehearsal_config: RunnerConfig, *, last_text: str, ok: bool) -> Path:
+    report_path = rehearsal_config.workspace_root / "runs" / "rehearsal" / "rehearsal_report.md"
+    if report_path.exists():
+        return report_path
+
+    code_files = sorted(
+        path.relative_to(rehearsal_config.workspace_root).as_posix()
+        for path in rehearsal_config.submission_code_dir.rglob("*")
+        if path.is_file()
+    ) if rehearsal_config.submission_code_dir.exists() else []
+    report_lines = [
+        "# Rehearsal Report",
+        "",
+        f"- status: {'ok' if ok else 'failed'}",
+        f"- final_message: {last_text or '(empty)'}",
+        f"- submission_code_files: {len(code_files)}",
+    ]
+    report_lines.extend(f"- code_file: {path}" for path in code_files)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(report_lines).strip() + "\n", encoding="utf-8")
+    return report_path
 
 
 def _prepare_session_logs(config: RunnerConfig) -> None:
@@ -1063,6 +1125,8 @@ def run_startup_readiness(config: RunnerConfig) -> int:
 
 
 def run_autonomous(config: RunnerConfig, tasks: list[str], max_steps: int | None = None) -> int:
+    prepare_run_workspace(config, run_label="autonomous")
+    _prepare_session_logs(config)
     docs_context = _load_docs_context(config.project_root)
     workspace_listing = _summarize_workspace(config)
     baseline_listing = _directory_listing(config.workspace_root / "baselines")
@@ -1098,6 +1162,7 @@ def run_autonomous_dry_run(config: RunnerConfig, tasks: list[str], max_steps: in
         print(f"LLM API key is not configured. Set {config.endpoint.api_key_env} before running autonomous_dry_run.")
         return 1
 
+    prepare_run_workspace(config, run_label="autonomous_dry_run")
     _prepare_session_logs(config)
     docs_context = _load_docs_context(config.project_root)
     workspace_listing = _summarize_workspace(config)
@@ -1165,6 +1230,7 @@ def run_autonomous_rehearsal(
         print(f"LLM API key is not configured. Set {config.endpoint.api_key_env} before running autonomous_rehearsal.")
         return 1
 
+    prepare_run_workspace(config, run_label="autonomous_rehearsal")
     _prepare_session_logs(config)
     rehearsal_budget = replace(
         config.budget,
@@ -1224,7 +1290,7 @@ def run_autonomous_rehearsal(
         phase_hint="implementation",
     )
 
-    report_path = rehearsal_config.workspace_root / "runs" / "rehearsal" / "rehearsal_report.md"
+    report_path = _write_rehearsal_report_if_missing(rehearsal_config, last_text=last_text, ok=ok)
     llm_log_result = validate_jsonl_logs(rehearsal_config.llm_log_path)
     tool_log_result = _validate_tool_log(rehearsal_config.tool_log_path)
     if not report_path.exists():

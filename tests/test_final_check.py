@@ -327,3 +327,69 @@ def test_readiness_check_reports_stage_exception_as_failure(workspace, monkeypat
     assert exit_code == 1
     assert "startup_readiness" in captured
     assert "network unavailable" in captured
+
+
+def test_readiness_check_does_not_prepare_run_workspace(workspace, monkeypatch, capsys):
+    from agent_runner import main as main_module
+
+    config = RunnerConfig.from_workspace(workspace)
+    called = {"count": 0}
+
+    def fake_prepare(cfg, *, run_label):
+        called["count"] += 1
+        return None
+
+    monkeypatch.setattr(main_module, "prepare_run_workspace", fake_prepare)
+    monkeypatch.setattr(main_module, "run_startup_readiness", lambda cfg: 0)
+
+    exit_code = main_module.run_readiness_check(config, tasks=["task1", "task2"], max_steps=3, max_train_seconds_per_task=10)
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert called["count"] == 0
+
+
+def test_autonomous_rehearsal_generates_minimal_report_when_model_omits_it(workspace, monkeypatch):
+    from agent_runner import main as main_module
+
+    config = RunnerConfig.from_workspace(workspace)
+    config.endpoint.api_key = "test-key"
+    called = {"count": 0}
+
+    def fake_prepare(cfg, *, run_label):
+        called["count"] += 1
+        assert run_label == "autonomous_rehearsal"
+        return None
+
+    def fake_execute_agent_loop(**kwargs):
+        report_state = kwargs["config"].workspace_root / "runs" / "rehearsal"
+        report_state.mkdir(parents=True, exist_ok=True)
+        (kwargs["config"].workspace_root / "submission" / "code" / "stub.py").write_text("print('ok')\n", encoding="utf-8")
+        (kwargs["config"].workspace_root / "submission" / "code_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "path": "submission/code/stub.py",
+                        "sha256": "ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d",
+                        "size": len("print('ok')\n".encode("utf-8")),
+                        "step_id": "step-001",
+                        "task_id": "autonomous_rehearsal",
+                        "timestamp": "2026-05-18T00:00:00+00:00",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return True, [], "REHEARSAL_COMPLETE"
+
+    monkeypatch.setattr(main_module, "prepare_run_workspace", fake_prepare)
+    monkeypatch.setattr(main_module, "execute_agent_loop", fake_execute_agent_loop)
+
+    exit_code = main_module.run_autonomous_rehearsal(config, tasks=["task1", "task2"], max_steps=20, max_train_seconds_per_task=10)
+
+    assert exit_code == 0
+    assert called["count"] == 1
+    report_path = workspace / "runs" / "rehearsal" / "rehearsal_report.md"
+    assert report_path.exists()
+    report_text = report_path.read_text(encoding="utf-8")
+    assert "REHEARSAL_COMPLETE" in report_text
