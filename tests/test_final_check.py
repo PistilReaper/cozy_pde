@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import hashlib
 
 import h5py
 import numpy as np
@@ -72,6 +73,54 @@ def _prepare_strict_submission_workspace(workspace: Path) -> None:
     _write_task_bundle(workspace, "task2", workspace / "data" / "task2_test.hdf5")
 
 
+def _write_code_manifest(workspace: Path) -> None:
+    content = (workspace / "submission" / "code" / "placeholder.py").read_bytes()
+    (workspace / "submission" / "code_manifest.json").write_text(
+        json.dumps(
+            [
+                {
+                    "path": "submission/code/placeholder.py",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                    "step_id": "step-001",
+                    "task_id": "task1",
+                    "timestamp": "2026-05-17T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_repeated_code_manifest(workspace: Path) -> None:
+    code_path = workspace / "submission" / "code" / "placeholder.py"
+    code_path.write_text("print('final')\n", encoding="utf-8")
+    final_content = code_path.read_bytes()
+    (workspace / "submission" / "code_manifest.json").write_text(
+        json.dumps(
+            [
+                {
+                    "path": "submission/code/placeholder.py",
+                    "sha256": hashlib.sha256(b"print('old')\n").hexdigest(),
+                    "size": len(b"print('old')\n"),
+                    "step_id": "step-000",
+                    "task_id": "task1",
+                    "timestamp": "2026-05-16T00:00:00+00:00",
+                },
+                {
+                    "path": "submission/code/placeholder.py",
+                    "sha256": hashlib.sha256(final_content).hexdigest(),
+                    "size": len(final_content),
+                    "step_id": "step-001",
+                    "task_id": "task1",
+                    "timestamp": "2026-05-17T00:00:00+00:00",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_final_check_warns_on_missing_artifacts_without_strict(workspace, capsys):
     (workspace / "submission" / "code" / "placeholder.py").write_text("print('ok')\n", encoding="utf-8")
     (workspace / "llm_logs" / "all_llm_calls.jsonl").write_text(
@@ -125,6 +174,82 @@ def test_final_check_strict_requires_methodology_pdf(workspace):
 
 def test_final_check_strict_uses_task_specific_test_hdf5(workspace):
     _prepare_strict_submission_workspace(workspace)
+    _write_code_manifest(workspace)
+    (workspace / "submission" / "methodology.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    config = RunnerConfig.from_workspace(workspace)
+
+    exit_code = run_final_check(config, strict=True)
+
+    assert exit_code == 0
+
+
+def test_final_check_strict_requires_code_manifest_json(workspace):
+    _prepare_strict_submission_workspace(workspace)
+    (workspace / "submission" / "methodology.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    config = RunnerConfig.from_workspace(workspace)
+
+    exit_code = run_final_check(config, strict=True)
+
+    assert exit_code == 1
+
+
+def test_final_check_strict_fails_when_validate_responses_logs_fails(workspace, monkeypatch):
+    _prepare_strict_submission_workspace(workspace)
+    (workspace / "submission" / "methodology.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    _write_code_manifest(workspace)
+    config = RunnerConfig.from_workspace(workspace)
+
+    def fake_validate_responses_logs(path, *, workspace_root=None):
+        assert Path(path) == config.llm_log_path
+        assert Path(workspace_root) == config.workspace_root
+        return {
+            "ok": False,
+            "error": "synthetic responses log failure",
+        }
+
+    monkeypatch.setattr("agent_runner.main.validate_responses_logs", fake_validate_responses_logs)
+
+    exit_code = run_final_check(config, strict=True)
+
+    assert exit_code == 1
+
+
+def test_final_check_strict_uses_final_code_manifest_entry_per_path(workspace):
+    _prepare_strict_submission_workspace(workspace)
+    (workspace / "submission" / "code" / "placeholder.py").write_text("print('final')\n", encoding="utf-8")
+    (workspace / "llm_logs" / "all_llm_calls.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-16T12:00:00+00:00",
+                "elapsed_seconds": 0.1,
+                "model": "gpt-5.4",
+                "profile": "coder",
+                "phase": "implementation",
+                "raw_response": {"id": "resp_1"},
+                "tool_calls": [
+                    {
+                        "name": "write_file",
+                        "call_id": "call_1",
+                        "arguments": {
+                            "path": "submission/code/placeholder.py",
+                            "content": "print('old')\n",
+                        },
+                    },
+                    {
+                        "name": "write_file",
+                        "call_id": "call_2",
+                        "arguments": {
+                            "path": "submission/code/placeholder.py",
+                            "content": "print('final')\n",
+                        },
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_repeated_code_manifest(workspace)
     (workspace / "submission" / "methodology.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
     config = RunnerConfig.from_workspace(workspace)
 
@@ -159,21 +284,46 @@ def test_readiness_check_reports_failure_when_any_stage_fails(workspace, monkeyp
     from agent_runner import main as main_module
 
     config = RunnerConfig.from_workspace(workspace)
-    monkeypatch.setattr(main_module, "run_preflight", lambda cfg: 0)
-    monkeypatch.setattr(main_module, "run_provider_health_check", lambda cfg: 0)
-    monkeypatch.setattr(main_module, "run_autonomous_dry_run", lambda cfg, tasks, max_steps: 0)
-    monkeypatch.setattr(main_module, "run_autonomous_rehearsal", lambda cfg, tasks, max_steps, max_train_seconds_per_task: 1)
-    monkeypatch.setattr(main_module, "run_final_check", lambda cfg, strict=False: 0)
-
-    class FakeCompleted:
-        returncode = 0
-        stdout = "55 passed\n"
-        stderr = ""
-
-    monkeypatch.setattr(main_module.subprocess, "run", lambda *args, **kwargs: FakeCompleted())
+    monkeypatch.setattr(main_module, "run_startup_readiness", lambda cfg: 1)
 
     exit_code = main_module.run_readiness_check(config, tasks=["task1", "task2"], max_steps=3, max_train_seconds_per_task=10)
     captured = capsys.readouterr().out
 
     assert exit_code == 1
-    assert "autonomous_rehearsal" in captured
+    assert "startup_readiness" in captured
+
+
+def test_readiness_check_does_not_require_final_submission_artifacts(workspace, monkeypatch, capsys):
+    from agent_runner import main as main_module
+
+    config = RunnerConfig.from_workspace(workspace)
+    monkeypatch.setattr(main_module, "run_startup_readiness", lambda cfg: 0)
+
+    exit_code = main_module.run_readiness_check(config, tasks=["task1", "task2"], max_steps=3, max_train_seconds_per_task=10)
+    captured = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "PASS pytest" not in captured
+    assert "PASS provider_health_check" not in captured
+    assert "FAIL provider_health_check" not in captured
+    assert "PASS final_check" not in captured
+    assert "FAIL final_check" not in captured
+    assert "PASS autonomous_rehearsal" not in captured
+    assert "FAIL autonomous_rehearsal" not in captured
+
+
+def test_readiness_check_reports_stage_exception_as_failure(workspace, monkeypatch, capsys):
+    from agent_runner import main as main_module
+
+    config = RunnerConfig.from_workspace(workspace)
+    def boom(cfg):
+        raise RuntimeError("network unavailable")
+
+    monkeypatch.setattr(main_module, "run_startup_readiness", boom)
+
+    exit_code = main_module.run_readiness_check(config, tasks=["task1", "task2"], max_steps=3, max_train_seconds_per_task=10)
+    captured = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "startup_readiness" in captured
+    assert "network unavailable" in captured

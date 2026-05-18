@@ -50,6 +50,10 @@ def _message_response(text: str) -> dict:
     }
 
 
+def _final_response(message: str = "RUNNER_FINALIZED") -> dict:
+    return _message_response(json.dumps({"type": "final", "message": message}))
+
+
 class SequenceClient:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -84,7 +88,7 @@ def test_loop_executes_single_tool_call(workspace):
                 ]
             },
             _router_response(),
-            _message_response("RUNNER_FINALIZED"),
+            _final_response(),
         ]
     )
 
@@ -149,7 +153,7 @@ def test_loop_rejects_multiple_tool_calls_without_execution(workspace):
                 ]
             },
             _router_response(),
-            _message_response("RUNNER_FINALIZED"),
+            _final_response(),
         ]
     )
 
@@ -189,7 +193,7 @@ def test_multi_tool_violation_retry_prompt(workspace):
                     },
                 ]
             },
-            _message_response("RUNNER_FINALIZED"),
+            _final_response(),
         ]
     )
 
@@ -261,7 +265,7 @@ def test_composite_tool_still_counts_as_single_tool_call(workspace):
                 ]
             },
             _router_response(profile="json_judge", phase="finalization"),
-            _message_response("RUNNER_FINALIZED"),
+            _final_response(),
         ]
     )
 
@@ -303,7 +307,7 @@ def test_write_file_provenance_still_passes_single_tool_mode(workspace):
                 ]
             },
             _router_response(),
-            _message_response("RUNNER_FINALIZED"),
+            _final_response(),
         ]
     )
 

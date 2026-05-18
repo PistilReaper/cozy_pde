@@ -30,6 +30,14 @@ def _normalize_logged_path(path_value: object, workspace_root: Path | None) -> s
         return candidate.as_posix()
 
 
+def _final_content_per_path(path_to_contents: dict[str, list[str]]) -> dict[str, str]:
+    return {
+        path: contents[-1]
+        for path, contents in path_to_contents.items()
+        if contents
+    }
+
+
 def validate_jsonl_logs(path: str | Path) -> dict:
     path = Path(path)
     if not path.exists():
@@ -117,6 +125,7 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
                     )
                 write_file_calls_by_path.setdefault(normalized_path, []).append(content)
 
+    final_logged_contents = _final_content_per_path(write_file_calls_by_path)
     traced_write_paths: list[str] = []
     if workspace_root is not None:
         submission_code_dir = workspace_root / "submission" / "code"
@@ -126,11 +135,11 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
             for file_path in sorted(candidate for candidate in submission_code_dir.rglob("*") if candidate.is_file()):
                 relative = file_path.relative_to(workspace_root).as_posix()
                 actual_content = file_path.read_text(encoding="utf-8")
-                logged_contents = write_file_calls_by_path.get(relative, [])
-                if not logged_contents:
+                logged_content = final_logged_contents.get(relative)
+                if logged_content is None:
                     untraced_files.append(relative)
                     continue
-                if actual_content not in logged_contents:
+                if actual_content != logged_content:
                     content_mismatch_files.append(relative)
                     continue
                 traced_write_paths.append(relative)
@@ -149,7 +158,7 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
                     traced_write_paths=traced_write_paths,
                     untraced_files=untraced_files,
                     content_mismatch_files=content_mismatch_files,
-                    logged_write_paths=sorted(write_file_calls_by_path),
+                    logged_write_paths=sorted(final_logged_contents),
                 )
 
     return success(
@@ -158,7 +167,7 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
         path=str(path),
         lines=len(lines),
         traced_write_paths=traced_write_paths,
-        logged_write_paths=sorted(write_file_calls_by_path),
+        logged_write_paths=sorted(final_logged_contents),
     )
 
 

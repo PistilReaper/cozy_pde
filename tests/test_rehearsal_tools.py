@@ -183,6 +183,45 @@ def test_write_file_updates_code_manifest_for_submission_code(workspace):
     assert "timestamp" in manifest[0]
 
 
+def test_write_file_code_manifest_keeps_only_final_entry_per_path(workspace):
+    config = RunnerConfig.from_workspace(workspace)
+    registry = build_tool_registry(
+        config,
+        ToolCallLogger(workspace / "internal_logs" / "tool_calls.jsonl"),
+    )
+    registry.set_context(task_id="task1", step_id="step-001")
+    first_content = "print('first version')\n"
+    second_content = "print('final version')\n"
+
+    first = registry.execute(
+        "write_file",
+        {
+            "path": "submission/code/foo.py",
+            "content": first_content,
+        },
+    )
+    assert first["ok"] is True
+
+    registry.set_context(task_id="task1", step_id="step-002")
+    second = registry.execute(
+        "write_file",
+        {
+            "path": "submission/code/foo.py",
+            "content": second_content,
+        },
+    )
+    assert second["ok"] is True
+
+    manifest_path = workspace / "submission" / "code_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert len(manifest) == 1
+    assert manifest[0]["path"] == "submission/code/foo.py"
+    assert manifest[0]["step_id"] == "step-002"
+    assert manifest[0]["size"] == len(second_content.encode("utf-8"))
+    assert manifest[0]["sha256"] == hashlib.sha256(second_content.encode("utf-8")).hexdigest()
+
+
 def test_analyze_log_detects_failure_modes_and_smoke_success(workspace):
     safety = WorkspaceSafety(workspace)
     log_path = workspace / "runs" / "train.log"

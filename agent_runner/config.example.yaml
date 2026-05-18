@@ -116,17 +116,6 @@ research:
       enabled: true
       api_key_env: GITHUB_TOKEN
       allow_unauthenticated: true
-    web:
-      provider_order:
-        - tavily
-        - exa
-        - brave
-        - google_cse
-      tavily_api_key_env: TAVILY_API_KEY
-      exa_api_key_env: EXA_API_KEY
-      brave_api_key_env: BRAVE_SEARCH_API_KEY
-      google_api_key_env: GOOGLE_API_KEY
-      google_cse_id_env: GOOGLE_CSE_ID
   allowed_domains:
     - arxiv.org
     - export.arxiv.org

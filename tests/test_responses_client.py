@@ -5,15 +5,10 @@ import types
 
 from agent_runner.config import FallbackProviderConfig, LLMProfile, OpenAIEndpointConfig
 from agent_runner.json_action_client import JsonActionClient
-from agent_runner.responses_client import ResponsesClient
 from agent_runner.responses_items import user_text
 
 
-def test_responses_client_aliases_json_action_client():
-    assert ResponsesClient is JsonActionClient
-
-
-def test_responses_client_uses_chat_completions_and_normalizes_text_output(monkeypatch):
+def test_json_action_client_uses_chat_completions_and_normalizes_text_output(monkeypatch):
     captured: dict[str, object] = {}
 
     class FakeOpenAI:
@@ -37,7 +32,7 @@ def test_responses_client_uses_chat_completions_and_normalizes_text_output(monke
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
 
-    client = ResponsesClient(
+    client = JsonActionClient(
         OpenAIEndpointConfig(base_url="https://example.com", api_key_env="LLM_API_KEY", api_key="test-key"),
     )
     response = client.create(
@@ -55,7 +50,7 @@ def test_responses_client_uses_chat_completions_and_normalizes_text_output(monke
     assert response["output"][0]["content"][0]["text"] == '{"type":"final","message":"RUNNER_FINALIZED"}'
 
 
-def test_responses_client_falls_back_to_deepseek_on_gateway_error(monkeypatch):
+def test_json_action_client_falls_back_to_deepseek_on_gateway_error(monkeypatch):
     class GatewayError(RuntimeError):
         status_code = 502
 
@@ -81,7 +76,7 @@ def test_responses_client_falls_back_to_deepseek_on_gateway_error(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
 
-    client = ResponsesClient(
+    client = JsonActionClient(
         OpenAIEndpointConfig(base_url="https://example.com", api_key_env="LLM_API_KEY", api_key="test-key"),
         fallback_provider=FallbackProviderConfig(
             enabled=True,

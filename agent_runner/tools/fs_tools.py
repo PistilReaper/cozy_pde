@@ -17,6 +17,25 @@ def _code_manifest_path(safety: WorkspaceSafety) -> Path:
     return safety.workspace_root / "submission" / "code_manifest.json"
 
 
+def _coalesce_manifest_entries(entries: object) -> list[dict]:
+    if not isinstance(entries, list):
+        return []
+
+    final_entries_by_path: dict[str, dict] = {}
+    ordered_paths: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        relative = entry.get("path")
+        if not isinstance(relative, str):
+            continue
+        if relative in final_entries_by_path:
+            ordered_paths.remove(relative)
+        ordered_paths.append(relative)
+        final_entries_by_path[relative] = entry
+    return [final_entries_by_path[path] for path in ordered_paths]
+
+
 def _update_code_manifest(
     *,
     safety: WorkspaceSafety,
@@ -41,17 +60,18 @@ def _update_code_manifest(
         existing = []
 
     context = runner_context or {}
-    existing.append(
-        {
-            "path": str(resolved_path.relative_to(safety.workspace_root)),
-            "sha256": _sha256_bytes(payload),
-            "size": len(payload),
-            "step_id": context.get("step_id", "unknown"),
-            "task_id": context.get("task_id", "unknown"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    manifest_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    updated_entry = {
+        "path": str(resolved_path.relative_to(safety.workspace_root)),
+        "sha256": _sha256_bytes(payload),
+        "size": len(payload),
+        "step_id": context.get("step_id", "unknown"),
+        "task_id": context.get("task_id", "unknown"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    final_entries = _coalesce_manifest_entries(existing)
+    final_entries = [entry for entry in final_entries if entry.get("path") != updated_entry["path"]]
+    final_entries.append(updated_entry)
+    manifest_path.write_text(json.dumps(final_entries, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_file(*, path: str, safety: WorkspaceSafety, max_chars: int = 20000) -> dict:

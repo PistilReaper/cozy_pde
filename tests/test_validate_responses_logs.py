@@ -161,3 +161,43 @@ def test_validate_responses_logs_normalizes_workspace_prefixed_write_paths(works
 
     assert result["ok"] is True
     assert result["data"]["traced_write_paths"] == ["submission/code/generated.py"]
+
+
+def test_validate_responses_logs_uses_final_logged_content_per_path(workspace):
+    code_file = workspace / "submission" / "code" / "generated.py"
+    code_file.write_text("print('final')\n", encoding="utf-8")
+    log_path = workspace / "llm_logs" / "all_llm_calls.jsonl"
+    _write_log(
+        log_path,
+        [
+            _base_payload(
+                [
+                    {
+                        "name": "write_file",
+                        "call_id": "call_1",
+                        "arguments": {
+                            "path": "submission/code/generated.py",
+                            "content": "print('first')\n",
+                        },
+                    }
+                ]
+            ),
+            _base_payload(
+                [
+                    {
+                        "name": "write_file",
+                        "call_id": "call_2",
+                        "arguments": {
+                            "path": "submission/code/generated.py",
+                            "content": "print('final')\n",
+                        },
+                    }
+                ]
+            ),
+        ],
+    )
+
+    result = validate_responses_logs(log_path, workspace_root=workspace)
+
+    assert result["ok"] is True
+    assert result["data"]["traced_write_paths"] == ["submission/code/generated.py"]

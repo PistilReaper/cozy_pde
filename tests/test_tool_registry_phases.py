@@ -38,7 +38,6 @@ def test_phase_tool_narrowing_reduces_available_tools(workspace):
         "read_file",
         "search_arxiv",
         "search_github",
-        "web_search",
         "fetch_url",
         "fetch_pdf",
         "parse_pdf",

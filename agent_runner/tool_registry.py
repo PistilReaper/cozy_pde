@@ -18,7 +18,7 @@ from .tools.hdf5_tools import inspect_hdf5
 from .tools.log_tools import analyze_log
 from .tools.package_tools import package_submission
 from .tools.python_tools import run_python
-from .tools.research_tools import fetch_pdf, fetch_url, parse_html, parse_pdf, search_arxiv, search_github, web_search
+from .tools.research_tools import fetch_pdf, fetch_url, parse_html, parse_pdf, search_arxiv, search_github
 from .tools.shell_tools import run_shell
 from .tools.snapshot_tools import rollback, snapshot
 from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs, validate_submission
@@ -552,26 +552,6 @@ def build_tool_registry(
                 query=query,
                 kind=kind,
                 max_results=max_results,
-                research=config.research,
-            ),
-            allowed_phases={"research", "planning"},
-        ),
-        ToolDefinition(
-            name="web_search",
-            description="Use configured local search providers in order without scraping search result pages directly.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "max_results": {"type": "integer", "default": 10},
-                    "domains": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["query"],
-            },
-            handler=lambda query, max_results=10, domains=None: web_search(
-                query=query,
-                max_results=max_results,
-                domains=domains,
                 research=config.research,
             ),
             allowed_phases={"research", "planning"},

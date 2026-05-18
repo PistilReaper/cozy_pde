@@ -27,6 +27,7 @@ from .prompts import (
     build_autonomous_user_prompt,
 )
 from .json_action_client import JsonActionClient
+from .safety import WorkspaceSafety
 from .responses_items import (
     extract_final_output_text,
     extract_function_calls,
@@ -41,7 +42,7 @@ from .skills import build_skill_catalog, load_local_skills
 from .state import AgentState
 from .tool_registry import ToolDefinition, ToolRegistry, build_tool_registry
 from .tools import failure, success
-from .tools.research_tools import fetch_pdf, fetch_url, parse_pdf, search_arxiv, search_github, web_search
+from .tools.research_tools import fetch_pdf, fetch_url, parse_pdf, search_arxiv, search_github
 from .tools.validate_tools import validate_jsonl_logs, validate_responses_logs, validate_submission
 
 SECRET_PATTERNS = [
@@ -114,6 +115,17 @@ def _validate_tool_log(path: Path) -> dict[str, Any]:
             if key not in payload:
                 return {"ok": False, "error": f"Missing {key} at line {index}"}
     return {"ok": True}
+
+
+def _read_tool_log_entries(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        entries.append(json.loads(line))
+    return entries
 
 
 def _prepare_session_logs(config: RunnerConfig) -> None:
@@ -310,14 +322,26 @@ def _validate_code_manifest(manifest_path: Path, workspace_root: Path) -> tuple[
         return False, [f"Failed to read code_manifest.json: {exc}"]
     if not isinstance(entries, list):
         return False, ["code_manifest.json must contain a list of file metadata"]
+    final_entries_by_path: dict[str, dict] = {}
+    ordered_paths: list[str] = []
     for entry in entries:
+        if not isinstance(entry, dict):
+            issues.append("code manifest entry must be an object")
+            continue
+        relative = entry.get("path")
+        if not isinstance(relative, str):
+            issues.append("code manifest entry missing path")
+            continue
+        if relative in final_entries_by_path:
+            ordered_paths.remove(relative)
+        ordered_paths.append(relative)
+        final_entries_by_path[relative] = entry
+    for relative in ordered_paths:
+        entry = final_entries_by_path[relative]
         for key in ("path", "sha256", "size", "step_id", "task_id", "timestamp"):
             if key not in entry:
                 issues.append(f"code manifest entry missing {key}")
                 continue
-        relative = entry.get("path")
-        if not isinstance(relative, str):
-            continue
         file_path = workspace_root / relative
         if not file_path.exists():
             issues.append(f"code manifest entry missing file: {relative}")
@@ -566,9 +590,6 @@ def execute_agent_loop(
                 return False, ledger, "multi_tool_call_violation: model emitted multiple tool calls"
 
             final_text = extract_final_output_text(response)
-            raw_text = extract_output_text(response).strip()
-            if final_text is None and completion_token in raw_text:
-                final_text = raw_text
             if not function_calls and final_text is None and active_tools and retry_count < 1:
                 retry_count += 1
                 ledger.extend(response_to_ledger_items(response))
@@ -582,7 +603,8 @@ def execute_agent_loop(
 
         ledger.extend(response_to_ledger_items(response))
         function_calls = extract_function_calls(response)
-        last_text = extract_final_output_text(response) or extract_output_text(response)
+        final_text = extract_final_output_text(response)
+        last_text = final_text or extract_output_text(response)
 
         if len(function_calls) == 1:
             call = function_calls[0]
@@ -592,7 +614,7 @@ def execute_agent_loop(
                 ledger.append(function_call_output(call.call_id, result))
             continue
 
-        if completion_token in last_text:
+        if final_text is not None and completion_token in final_text:
             return True, ledger, last_text
 
         ledger.append(user_text(continue_instruction))
@@ -720,6 +742,7 @@ def run_provider_health_check(config: RunnerConfig) -> int:
         allow_submission_writes=False,
         extra_tools=[_make_echo_tool()],
     )
+    tool_log_count = len(_read_tool_log_entries(config.tool_log_path))
     echo_items = [
         system_text("You are validating function tool-calling. You must call echo_tool exactly once."),
         user_text(
@@ -744,6 +767,16 @@ def run_provider_health_check(config: RunnerConfig) -> int:
     if not echo_ok:
         print(f"FAIL echo_tool_call: {echo_text}")
         return 1
+    echo_entries = _read_tool_log_entries(config.tool_log_path)[tool_log_count:]
+    if not any(
+        entry.get("tool_name") == "echo_tool"
+        and entry.get("arguments", {}).get("text") == "hello-tool"
+        and entry.get("result", {}).get("ok") is True
+        for entry in echo_entries
+    ):
+        print("FAIL echo_tool_call: echo_tool was not actually executed")
+        return 1
+    tool_log_count += len(echo_entries)
     checks.append("PASS echo_tool_call")
 
     write_items = [
@@ -770,6 +803,15 @@ def run_provider_health_check(config: RunnerConfig) -> int:
     )
     if not write_ok:
         print(f"FAIL write_file_tool_call: {write_text}")
+        return 1
+    write_entries = _read_tool_log_entries(config.tool_log_path)[tool_log_count:]
+    if not any(
+        entry.get("tool_name") == "write_file"
+        and entry.get("arguments", {}).get("path") == "runs/scratch/provider_health_check.txt"
+        and entry.get("result", {}).get("ok") is True
+        for entry in write_entries
+    ):
+        print("FAIL write_file_tool_call: write_file was not actually executed")
         return 1
     if not (config.workspace_root / "runs" / "scratch" / "provider_health_check.txt").exists():
         print("FAIL write_file_tool_call: provider_health_check.txt was not created")
@@ -892,33 +934,6 @@ def run_local_research_check(config: RunnerConfig, http_client=None) -> int:
         ]
     )
 
-    web_result = web_search(
-        query="PDEBench Burgers FNO baseline",
-        domains=["github.com", "arxiv.org"],
-        research=config.research,
-        http_client=http_client,
-    )
-    if web_result["data"]["provider"] is None:
-        report_lines.extend(
-            [
-                "## Web Search",
-                "",
-                "- local provider search skipped because no configured provider key was available",
-                f"- skipped_providers: {', '.join(web_result['data']['skipped_providers']) or 'none'}",
-                "",
-            ]
-        )
-    else:
-        report_lines.extend(
-            [
-                "## Web Search",
-                "",
-                f"- provider: {web_result['data']['provider']}",
-                f"- results: {len(web_result['data']['results'])}",
-                "",
-            ]
-        )
-
     fetch_target = github_record["raw_url"] or arxiv_record["abs_url"]
     fetch_result = fetch_url(url=fetch_target, research=config.research, http_client=http_client)
     if not fetch_result["ok"]:
@@ -968,6 +983,83 @@ def run_local_research_check(config: RunnerConfig, http_client=None) -> int:
 
     print("PASS local_research_check")
     return 0
+
+
+def run_startup_readiness(config: RunnerConfig) -> int:
+    checks: list[str] = []
+    failures: list[str] = []
+
+    try:
+        config.ensure_workspace_dirs()
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL startup_readiness config: {exc}")
+        return 1
+    checks.append("PASS config_loaded")
+
+    if config.endpoint.api_key:
+        checks.append(f"PASS api_key: {config.endpoint.api_key_env}")
+    else:
+        failures.append(f"FAIL api_key: set {config.endpoint.api_key_env}")
+
+    for path in [config.llm_log_path.parent, config.tool_log_path.parent, config.workspace_root / "runs" / "scratch"]:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".startup_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks.append(f"PASS writable: {path}")
+
+    registry = build_tool_registry(
+        config,
+        ToolCallLogger(config.tool_log_path),
+    )
+    registry.set_context(task_id="startup_readiness", step_id="step-001", phase="planning")
+    schemas = registry.response_function_tools()
+    if schemas:
+        checks.append(f"PASS tool_schema: {len(schemas)} tools")
+    else:
+        failures.append("FAIL tool_schema: no tools available")
+
+    readme_path = config.workspace_root / "runs" / "scratch" / "startup_probe.txt"
+    readme_path.write_text("startup probe\n", encoding="utf-8")
+    tool_result = registry.execute("read_file", {"path": "runs/scratch/startup_probe.txt"})
+    if tool_result["ok"]:
+        checks.append("PASS single_tool_call")
+    else:
+        failures.append(f"FAIL single_tool_call: {tool_result['error']}")
+
+    registry.set_context(task_id="startup_readiness", step_id="step-002", phase="research")
+    research_tool_names = {schema["name"] for schema in registry.response_function_tools()}
+    if config.research.enabled and config.research.providers.arxiv.enabled:
+        if "search_arxiv" in research_tool_names:
+            checks.append("PASS research_arxiv: available")
+        else:
+            failures.append("FAIL research_arxiv: tool not registered")
+    else:
+        checks.append("PASS research_arxiv: skipped")
+    if config.research.enabled and config.research.providers.github.enabled:
+        if "search_github" in research_tool_names:
+            if config.research.providers.github.api_key or config.research.providers.github.allow_unauthenticated:
+                checks.append("PASS research_github: available")
+            else:
+                checks.append("PASS research_github: skipped")
+        else:
+            failures.append("FAIL research_github: tool not registered")
+    else:
+        checks.append("PASS research_github: skipped")
+
+    safety = WorkspaceSafety(config.workspace_root)
+    safety_check = safety.validate_write_path("workspace/submission/code/startup.py")
+    if safety_check.ok and safety_check.resolved_path is not None:
+        normalized = safety_check.resolved_path.relative_to(config.workspace_root).as_posix()
+        if normalized == "submission/code/startup.py":
+            checks.append("PASS workspace_path_normalization")
+        else:
+            failures.append(f"FAIL workspace_path_normalization: resolved to {normalized}")
+    else:
+        failures.append(f"FAIL workspace_path_normalization: {safety_check.error or 'unknown error'}")
+
+    _print_lines(checks + failures)
+    return 0 if not failures else 1
 
 
 def run_autonomous(config: RunnerConfig, tasks: list[str], max_steps: int | None = None) -> int:
@@ -1217,6 +1309,16 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
     else:
         warnings.append(f"WARN logs JSONL: {llm_log_result['error']}")
 
+    if strict:
+        responses_log_result = validate_responses_logs(
+            config.llm_log_path,
+            workspace_root=config.workspace_root,
+        )
+        if responses_log_result["ok"]:
+            checks.append("PASS responses logs trace submission/code")
+        else:
+            failures.append(f"FAIL responses logs: {responses_log_result['error']}")
+
     if config.submission_code_dir.exists():
         checks.append("PASS submission/code exists")
     elif strict:
@@ -1293,6 +1395,8 @@ def run_final_check(config: RunnerConfig, strict: bool = False) -> int:
         else:
             for issue in code_manifest_issues:
                 failures.append(f"FAIL code_manifest.json: {issue}")
+    elif strict:
+        failures.append("FAIL code_manifest.json missing")
 
     rehearsal_report = config.workspace_root / "runs" / "rehearsal" / "rehearsal_report.md"
     if rehearsal_report.exists() and not any((config.submission_dir / task.pred_filename).exists() for task in config.submission_task_list):
@@ -1330,24 +1434,18 @@ def run_readiness_check(
             }
         )
 
-    record("preflight", run_preflight(config))
+    def run_stage(name: str, func, *args) -> None:
+        try:
+            result = func(*args)
+        except Exception as exc:  # noqa: BLE001
+            record(name, 1, f"{type(exc).__name__}: {exc}")
+            return
+        if isinstance(result, int):
+            record(name, result)
+        else:
+            record(name, 1, f"unexpected return value: {result!r}")
 
-    pytest_result = subprocess.run(
-        [str(config.project_root / ".venv" / "bin" / "python"), "-m", "pytest", "-q"],
-        cwd=str(config.project_root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    record("pytest", pytest_result.returncode, (pytest_result.stdout or pytest_result.stderr).strip())
-
-    record("provider_health_check", run_provider_health_check(config))
-    record("autonomous_dry_run", run_autonomous_dry_run(config, tasks, max_steps or 6))
-    record(
-        "autonomous_rehearsal",
-        run_autonomous_rehearsal(config, tasks, max_steps or 20, max_train_seconds_per_task),
-    )
-    record("final_check", run_final_check(config, strict=True))
+    run_stage("startup_readiness", run_startup_readiness, config)
 
     safe_to_start = all(bool(stage["ok"]) for stage in stage_results)
     report_path = report_dir / "report.json"
