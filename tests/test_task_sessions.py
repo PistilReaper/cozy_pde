@@ -18,7 +18,7 @@ from agent_runner.main import (
     parse_args,
     run_package_final,
 )
-from agent_runner.prompts import SYSTEM_PROMPT, build_task_instruction_block
+from agent_runner.prompts import REHEARSAL_PROMPT, SYSTEM_PROMPT, TEST_TOOL_LOOP_PROMPT, build_task_instruction_block
 
 
 def _write_task_test(path, *, samples: int, total_steps: int, offset: float = 0.0) -> None:
@@ -195,6 +195,16 @@ def test_task_prompt_blocks_include_required_hard_rules():
     assert "parameter inference in logs" in task3_block
     assert "workspace/submission/code/task3/" in task3_block
     assert "Do not use Task 1 or Task 2 weights for Task 3" in SYSTEM_PROMPT
+
+
+def test_runner_prompt_constants_are_english():
+    assert "autonomous scientific research agent" in SYSTEM_PROMPT
+    assert "This is a rehearsal" in REHEARSAL_PROMPT
+    assert "Use `write_file`" in TEST_TOOL_LOOP_PROMPT
+    for text in (SYSTEM_PROMPT, REHEARSAL_PROMPT, TEST_TOOL_LOOP_PROMPT):
+        assert "你" not in text
+        assert "请" not in text
+        assert "必须" not in text
 
 
 def test_deterministic_methodology_text_describes_runner_architecture_and_no_fake_experiments():

@@ -14,6 +14,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .dependency_bootstrap import ensure_main_bootstrap_dependencies, ensure_mode_dependencies
+
+ensure_main_bootstrap_dependencies()
+
 import h5py
 import numpy as np
 
@@ -1894,6 +1898,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        ensure_mode_dependencies(args.mode)
+    except RuntimeError as exc:
+        print(f"FAIL dependency bootstrap: {exc}")
+        return 1
     config = load_config(args.config, workspace_override=args.workspace)
     try:
         tasks = _validate_known_tasks(config, args.tasks)

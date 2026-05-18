@@ -2,6 +2,7 @@ openai>=2.0.0
 PyYAML>=6.0
 h5py>=3.10
 numpy>=1.26
+pypdf>=4.0
 pytest>=8.0
-# torch is expected to be installed separately for training environments.
-
+# torch may be preinstalled for training environments; the runner will also attempt
+# to install it automatically for training-oriented modes if it is missing.

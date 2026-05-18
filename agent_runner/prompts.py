@@ -49,27 +49,27 @@ Your responses and tool calls must make the final code and experiments traceable
 When all checks for the current task pass, output `RUNNER_FINALIZED`.
 """
 
-REHEARSAL_PROMPT = """你现在处于 autonomous_rehearsal 模式，不是正式长训练。
+REHEARSAL_PROMPT = """This is a rehearsal in autonomous_rehearsal mode, not a formal long training run.
 
-目标：
-1. 证明完整闭环能跑通。
-2. 你必须自己生成 submission/code 中的代码。
-3. 你必须先读 docs、baseline 和数据结构。
-4. 你必须做最小可运行模型。
-5. 你必须优先 smoke train 和 shape correctness。
-6. 你不能下载外部数据。
-7. 你不能调用数值求解器。
-8. Task 1 可以先不依赖 checkpoint，Task 2 必须从头训练。
-9. 如果训练失败，你需要读日志、定位错误、修改代码、重试。
-10. 如果 smoke train 成功，你需要生成 rehearsal prediction 并调用 validator。
-11. 最后输出 REHEARSAL_COMPLETE 并写 rehearsal report。
-12. 如果当前没有可用的正式数据文件，不要伪造 HDF5 数据，不要尝试 smoke training，用最小代码骨架 + 明确的数据缺失报告完成 rehearsal。
-13. 不要读取 submission/task1_logs.log 或 submission/task2_logs.log 这类旧会话日志，它们不属于 rehearsal 所需信息。
-14. 每个响应最多只能调用一个 function tool；如果需要多个操作，必须分多轮串行调用。
+Goals:
+1. Prove the full research loop can run end to end.
+2. Generate the code under `submission/code/` yourself.
+3. Read the docs, baselines, and data structure before acting.
+4. Start with the smallest runnable model.
+5. Prioritize smoke training and shape correctness.
+6. Do not download external data.
+7. Do not call numerical PDE solvers.
+8. Task 1 may proceed without a checkpoint at first, but Task 2 must be trained from scratch.
+9. If training fails, read the logs, identify the error, modify the code, and retry.
+10. If smoke training succeeds, generate a rehearsal prediction and run the validator.
+11. Finish by outputting REHEARSAL_COMPLETE and writing a rehearsal report.
+12. If the required formal HDF5 files are unavailable, do not fabricate data and do not attempt smoke training. Finish the rehearsal with a minimal code skeleton plus an explicit data-missing report.
+13. Do not read old session logs such as `submission/task1_logs.log` or `submission/task2_logs.log`; they are not required for rehearsal.
+14. Each response may call at most one function tool. If multiple actions are needed, perform them across multiple turns.
 """
 
-TEST_TOOL_LOOP_PROMPT = """请调用 write_file，在 submission/code/hello.py 写入一个最小 Python 文件。
-收到工具结果后，简短总结是否成功。"""
+TEST_TOOL_LOOP_PROMPT = """Use `write_file` to create a minimal Python file at `submission/code/hello.py`.
+After the tool result arrives, briefly summarize whether it succeeded."""
 
 
 def build_task_instruction_block(task: str) -> str:
