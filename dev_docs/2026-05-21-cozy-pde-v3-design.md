@@ -19,7 +19,9 @@ Cozy PDE v3 的目标是把当前系统重构为一个由 Python 程序主导的
 本次重构的边界如下：
 
 - 允许按文档直接重组模块、入口和命名，不要求沿用第二版形式兼容。
-- 第三版只支持单一 task 正式运行，不支持多任务共享 session，也不支持串行多个任务。
+- 第三版只支持单 task formal run session；每个 formal run 只优化一个 task，并产生该 task 独立日志、状态、实验记录、checkpoint 与预测产物。
+- task isolation 仅适用于 runs、logs、checkpoints、artifacts 与预测产物；最终 `submission/code/` 必须是一个跨 task 共用、持续演化的共享源码目录。
+- 后续 task 只能在已冻结的共享代码版本上做向后兼容的增量修改，不能通过复制多套 task 专属源码来规避兼容性问题。
 - 保留 `DeepSeek` 作为 Responses 备用通道，但它只是 provider failover，不是第二套上层协议。
 - 保留 `scripts/proxy.py`，并要求其尽早通过第三版验收。
 - 保留第二版中 `E/F` 两类能力：
@@ -39,8 +41,9 @@ Cozy PDE v3 的目标是把当前系统重构为一个由 Python 程序主导的
 - 不保留 `chat.completions` 作为任何正式或过渡主路径。
 - 不保留 `json_action` 作为任何上层动作协议。
 - 不保留 LLM 作为 router、shell 编排器、最终 gate 决策器。
-- 不保留多任务 formal session、共享日志导出、多任务串行正式运行。
+- 不保留多任务 formal session、共享 session 日志污染、多个 task 连续复用同一 formal session 状态。
 - 不允许在 `methodology` 生成阶段让 LLM 自由发挥、补写事实或美化到与运行记录不一致。
+- 不允许为每个 task 复制一套 `train.py / infer.py / model.py / dataset.py` 实现。
 
 ## 3. 总体架构
 
@@ -60,6 +63,7 @@ cozy_pde/
 │   ├── memory_store.py
 │   ├── context_packer.py
 │   ├── experiment_engine.py
+│   ├── code_evolution.py
 │   ├── profiles.py
 │   ├── prompts.py
 │   ├── logging.py
@@ -91,7 +95,92 @@ cozy_pde/
 - `responses_client.py` 是唯一 LLM 传输入口。
 - `agent_loop.py` 只消费第三版标准化后的 Responses items。
 - provider 主备、proxy、raw response、research、provenance 是下层能力，不得反向泄漏到上层协议。
+- `submission/code/` 是唯一正式共享源码目录，所有 task 都必须操作同一份代码库。
+- `code_evolution.py` 负责共享代码版本演化、补丁记录、兼容性 gate 与回滚决策。
 - 第二版 `agent_runner` 在迁移完成后只允许保留极薄兼容壳，若无必要应删除。
+
+### 3.1 共享代码库原则
+
+第三版必须显式遵守下面这条核心原则：
+
+`Task isolation is for runs, logs, checkpoints, and artifacts; code is a shared evolving product.`
+
+含义如下：
+
+- Task 1、Task 2、Task 3 可以分别启动独立 formal session。
+- 每个 formal session 只能优化一个 task。
+- 各 task 的日志、实验状态、checkpoint、预测文件、运行工件彼此隔离。
+- 但所有 formal runs 必须共同维护同一份 `submission/code/`。
+- 后续 task 只能在前序冻结代码版本上做增量修改。
+- 任何对共享代码的修改都必须记录版本、父版本、变更意图、受影响接口与兼容性验证结果。
+
+### 3.2 共享代码目录与任务配置
+
+最终正式提交的源码目录必须是：
+
+```text
+submission/code/
+├── train.py
+├── infer.py
+├── model.py
+├── dataset.py
+├── losses.py
+├── metrics.py
+├── task_specs.py
+├── config.py
+└── utils.py
+```
+
+任务差异只能进入配置或 TaskSpec，不允许复制源码：
+
+```text
+configs/tasks/
+├── task1.yaml
+├── task2.yaml
+└── task3.yaml
+```
+
+`train.py` 与 `infer.py` 的 CLI 必须稳定，并至少支持：
+
+- `--task`
+- `--config`
+- `--data_dir`
+- `--output_dir` 或 `--output`
+- `--checkpoint`（推理场景）
+
+第三版必须把这组 CLI 视为共享 API contract，而不是某个 task 的局部约定。
+
+### 3.3 TaskSpec 注册表
+
+任务差异必须通过 `TaskSpec` 注册表表达，而不是在共享模型代码里到处写 task 分支。
+
+推荐结构：
+
+```python
+@dataclass
+class TaskSpec:
+    task_id: str
+    equation: str
+    input_steps: int
+    output_steps: int
+    total_steps: int
+    spatial_points: int
+    pred_shape: tuple[int, int, int]
+    train_files: list[str]
+    val_files: list[str]
+    test_file: str
+    conditioning_fields: list[str]
+    allow_pretrained_checkpoint: bool
+    must_train_from_scratch: bool
+    first_steps_must_match: int
+    inference_time_limit_sec: float
+```
+
+要求：
+
+- Task 1、Task 2、Task 3 的数据、shape、时间步、checkpoint 规则、前若干步必须一致的约束都应由 `TaskSpec` 驱动。
+- 共享代码只消费抽象字段，例如 `input_steps`、`output_steps`、`spatial_points`、`conditioning_fields`、`equation`。
+- 不允许在 `model.py`、`dataset.py`、`utils.py` 中硬编码 task 测试文件名或未来目标文件路径。
 
 ## 4. Responses 协议与 Provider 适配
 
@@ -309,7 +398,9 @@ cozy-pde status
 
 - 只允许单 task
 - 不支持多任务共享 session
-- 不支持串行多个任务
+- 单次 `run` invocation 只接受一个 task
+- 必须操作同一份共享 `submission/code/`
+- 若当前 task 需要修改共享代码，则在进入新 task 训练前必须通过已支持任务的兼容性检查
 
 ### 7.2 `check-provider`
 
@@ -356,6 +447,7 @@ cozy-pde status
 - 校验 provenance
 - 校验 inference time
 - 校验 package readiness
+- 校验共享代码 API contract 与向后兼容性 gate
 
 要求：
 
@@ -372,6 +464,7 @@ cozy-pde status
 - 合并主备 proxy raw logs
 - 导出正式日志
 - 生成 manifest / code manifest / methodology
+- 生成全局 shared code provenance union
 - 冻结 submission snapshot
 - 生成最终 zip
 
@@ -421,6 +514,8 @@ cache_hit_ratio_rolling
 fallback_status
 capability_status
 finalize_gate_status
+shared_code_version
+supported_tasks
 ```
 
 设计原则：
@@ -429,6 +524,7 @@ finalize_gate_status
 - 审计细节进入 memory 和 logs
 - state 必须可以持久化与恢复
 - `last_llm_call_id`、`last_tool_call_id`、`best_artifact_version`、`submission_snapshot_id` 作为 state、memory、log、artifact 的稳定外键
+- `shared_code_version` 与 `supported_tasks` 作为共享代码演化与兼容性 gate 的调度事实
 
 ## 9. Router 设计
 
@@ -494,6 +590,8 @@ workspace/memory/
 - `failure_patterns`
 - `research_sources`
 - `code_artifacts`
+- `code_snapshots`
+- `code_patch_records`
 - `cache_metrics`
 - `decision_records`
 
@@ -526,8 +624,48 @@ workspace/memory/
 - `failure_patterns`：症状 -> 诊断 -> 恢复动作 -> 预防检查
 - `research_sources`：research 来源、摘要、缓存路径、许可信息
 - `code_artifacts`：代码文件与生成调用的映射
+- `code_snapshots`：共享代码版本、父版本、支持任务矩阵、API contract hash
+- `code_patch_records`：每次共享代码变更的 patch 记录、兼容性声明、验证结果
 - `cache_metrics`：prompt caching 指标
 - `decision_records`：路由决策与结果
+
+### 10.3 共享代码演化对象
+
+`code_evolution.py` 负责管理共享源码的版本演化。推荐对象如下：
+
+```python
+@dataclass
+class CodeSnapshot:
+    code_version: str
+    parent_version: str | None
+    content_hash: str
+    api_contract_hash: str
+    supported_tasks: list[str]
+    task_support_matrix: dict[str, dict]
+    created_by_run_id: str
+    created_at: str
+
+
+@dataclass
+class CodePatchRecord:
+    patch_id: str
+    base_code_version: str
+    new_code_version: str
+    task_context: str
+    changed_files: list[str]
+    change_intent: str
+    backward_compatibility_claim: str
+    affected_interfaces: list[str]
+    llm_call_ids: list[str]
+    validation_results: dict
+```
+
+要求：
+
+- 每次修改 `submission/code/` 都必须形成 `CodePatchRecord`。
+- 每个新共享代码版本都必须形成 `CodeSnapshot`。
+- 共享代码修改必须有父版本、有受影响接口、有兼容性声明、有验证结果。
+- 不允许“覆盖式重写后继续跑”，而不留下版本演化记录。
 
 ## 11. ContextPacker 设计
 
@@ -576,6 +714,7 @@ workspace/memory/
 - benchmark
 - failure recovery
 - best artifact freeze
+- shared code compatibility gate
 - finalization gate
 
 建议状态迁移：
@@ -602,6 +741,23 @@ init
 - 对 `loss nan / OOM / shape mismatch / inference timeout` 优先走规则恢复
 - 连续恢复失败后才进入 LLM diagnosis
 - 最佳工件必须显式冻结并版本化
+- 若共享代码在后续 task 中被修改，则必须先跑已支持任务的兼容性检查，再进入新 task 训练
+- 若兼容性检查失败，系统必须回滚到上一个共享代码版本，或者强制进入只修兼容性的恢复路径
+
+### 12.1 共享代码兼容性检查
+
+兼容性检查至少应包括：
+
+- CLI parse test
+- small-batch smoke train
+- checkpoint-load + inference-shape test
+
+流程示例：
+
+- Task 1 形成 `code_version=v1`
+- Task 2 读取 `v1`，形成 `v2`
+- `v2` 在 Task 2 长训练前，必须先通过 Task 1 compatibility smoke test
+- 若 Task 1 compatibility 失败，系统必须回滚到 `v1`，或只允许修兼容性，不允许继续新实验
 
 ## 13. LLM 使用边界
 
@@ -621,6 +777,24 @@ init
 - finalization 判定
 - package 判定
 
+Prompt 与 coding agent 约束中必须包含以下强规则：
+
+```text
+You are maintaining one shared neural-operator codebase for all tasks.
+Do not create task-specific source directories or duplicate train/infer/model files.
+Task-specific differences must be expressed through TaskSpec, config files, data paths, checkpoint paths, or small registered adapters.
+When modifying shared code for a later task, preserve all previously accepted task commands and run backward-compatibility checks before training the new task.
+```
+
+必须显式禁止：
+
+- 写出 `code/task1/train.py` 与 `code/task2/train.py` 这类分叉实现
+- 替换 `train.py` 或 `infer.py` 从而破坏已有 CLI 行为
+- 后续 task 开始后删除先前 task 支持
+- 在模型逻辑中硬编码测试文件名
+- 在策略禁止时把 Task 1 checkpoint/data 用于 Task 2
+- 为 Task 3 加载公开 pretrained weights
+
 ## 14. E/F 能力迁移
 
 ### 14.1 E：日志审计与可追溯
@@ -637,6 +811,7 @@ init
 - JSONL / Responses logs 校验
 - proxy logs 合并导出
 - code manifest / manifest
+- shared code provenance union
 - secret leak scan
 - run status 汇总
 
@@ -676,6 +851,14 @@ Research 结果必须进入 memory 和 cache，只允许以摘要和引用形式
 - `methodology_ok`
 - `secret_scan_ok`
 - `task_rule_ok`
+- `shared_code_ok`
+- `code_provenance_ok`
+- `api_contract_ok`
+- `task1_compat_ok`
+- `task2_compat_ok`
+- `task3_compat_ok`
+- `incremental_patch_ok`
+- `no_task_specific_code_fork_ok`
 - `overall_ok`
 - `failures`
 - `warnings`
@@ -698,6 +881,8 @@ Research 结果必须进入 memory 和 cache，只允许以摘要和引用形式
 - `validation reports`
 - `artifact metadata`
 - `final package snapshot`
+- `code_snapshots`
+- `code_patch_records`
 
 要求：
 
@@ -708,6 +893,40 @@ Research 结果必须进入 memory 和 cache，只允许以摘要和引用形式
 - 若后续引入 LLM，只允许做不改变事实的语言压缩
 
 `methodology` 的本质是“结构化运行记录的人类可读视图”，不是赛末自由总结。
+
+### 16.1 共享代码 Provenance Union
+
+最终 package 不能只说明“当前 task 修改了哪些文件”，还必须产出跨 task 的共享代码 provenance union。
+
+建议结构：
+
+```json
+{
+  "shared_code_versions": [
+    {
+      "version": "v1",
+      "created_during": "task1",
+      "files": ["model.py", "dataset.py", "train.py", "infer.py", "utils.py"],
+      "llm_call_ids": ["task1:step-003", "task1:step-004"],
+      "validated_tasks": ["task1"]
+    },
+    {
+      "version": "v2",
+      "created_during": "task2",
+      "parent": "v1",
+      "changed_files": ["model.py", "dataset.py", "task_specs.py"],
+      "llm_call_ids": ["task2:step-008", "task2:step-009"],
+      "validated_tasks": ["task1", "task2"]
+    }
+  ]
+}
+```
+
+要求：
+
+- 每个最终共享源码文件都必须能在跨 task 联合日志中追溯。
+- package 阶段必须生成强 `code_manifest.json`，证明最终 `submission/code/` 由各 task logs 的 LLM 调用联合生成。
+- task logs 可以彼此独立，但最终 package 必须产出可证明 union provenance 的结构化记录。
 
 ## 17. Capability Check 设计
 
@@ -756,6 +975,8 @@ Provider capability check 是正式运行前的重要门槛。
 - `failure recovery > implementation`
 - finalize gate 结构化
 - engine 能覆盖主路径与恢复路径
+- 共享代码版本演化可追踪
+- 后续 task 进入训练前会触发已支持任务兼容性检查
 
 ### 18.4 E/F
 
@@ -769,6 +990,7 @@ Provider capability check 是正式运行前的重要门槛。
 - methodology 仅来自 structured records
 - 不出现日志中不存在的实验或结论
 - 能回指 experiment / decision / artifact
+- 共享代码 union provenance 可回指 code version / patch / llm call
 
 ## 19. 迁移策略
 
@@ -795,6 +1017,7 @@ Provider capability check 是正式运行前的重要门槛。
 ### 阶段 4：接入状态机闭环
 
 - 实现 AgentState、Router、Engine、Memory、ContextPacker
+- 实现共享代码版本演化、兼容性 gate、回滚与 code provenance union
 - 跑通单 task formal run
 
 ### 阶段 5：切默认入口并删旧层
@@ -814,6 +1037,7 @@ Provider capability check 是正式运行前的重要门槛。
 - `autonomous_rehearsal`
 - rehearsal profile
 - 多任务 formal session / 多任务导出 / 串行多任务运行
+- task-specific 源码分叉目录方案
 
 保留但迁移：
 
@@ -830,6 +1054,8 @@ Provider capability check 是正式运行前的重要门槛。
 - proxy 原始记录不完整或未脱敏
 - context packer 退化为长上下文
 - methodology 生成与真实运行记录脱节
+- 后续 task 修改共享代码时破坏先前 task 的训练/推理接口
+- 共享代码 provenance 无法跨 task 联合证明
 
 控制方式：
 
@@ -838,9 +1064,11 @@ Provider capability check 是正式运行前的重要门槛。
 - proxy 早验收
 - token budget 硬限制
 - methodology 结构化机械生成
+- 共享代码 compatibility gate
+- `code_snapshots` / `code_patch_records` / `code_manifest union`
 
 ## 22. 最终结论
 
-Cozy PDE v3 必须被实现为一个单任务、Responses-only、Python 主导的科研状态机。它的上层只认统一 Responses 语义；provider 主备、proxy、research、provenance、fallback、raw response 都必须沉到下层实现。`DeepSeek` 是统一协议下的 formal fallback，`scripts/proxy.py` 是正式 provenance 链的重要组成部分，`methodology` 必须由结构化运行记录机械生成。
+Cozy PDE v3 必须被实现为一个单 task formal run session、Responses-only、Python 主导的科研状态机。它的上层只认统一 Responses 语义；provider 主备、proxy、research、provenance、fallback、raw response 都必须沉到下层实现。formal run 的隔离对象是日志、状态、checkpoint、实验与预测产物，而最终 `submission/code/` 必须是一套跨 task 共享、可增量演化、可兼容验证、可跨 task 联合追溯的源码目录。`DeepSeek` 是统一协议下的 formal fallback，`scripts/proxy.py` 是正式 provenance 链的重要组成部分，`methodology` 必须由结构化运行记录机械生成。
 
 这一设计文档批准后，下一步是基于本规格编写第三版 implementation plan，并据此执行重构。
