@@ -1,85 +1,79 @@
 from __future__ import annotations
 
-import json
-
-from agent_runner.config import RunnerConfig
-from agent_runner.logger import LLMCallLogger
-from agent_runner.router import Router
+from cozy_pde_v3.deterministic_router import DeterministicRouter, route_agent_state
+from cozy_pde_v3.state import AgentState
 
 
-class FakeResponsesClient:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls = []
+def test_router_requires_capability_checks_before_implementation() -> None:
+    state = AgentState(task="task1", shared_code_version="sha256:base")
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.responses.pop(0)
+    decision = route_agent_state(state, capability_ready=False, preflight_pending=False)
 
-
-def _message_response(text: str) -> dict:
-    return {
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            }
-        ]
-    }
+    assert decision.phase == "capability_readiness"
+    assert decision.profile == "strong_planner"
+    assert decision.allowed_tools == []
+    assert decision.allow_hosted_research is False
+    assert decision.requires_llm is False
+    assert decision.deterministic_action == "run_capability_checks"
+    assert decision.reason_code == "capability_not_ready"
 
 
-def test_router_uses_llm_json_when_valid(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    client = FakeResponsesClient(
-        [
-            _message_response(
-                json.dumps(
-                    {
-                        "profile": "coder",
-                        "phase": "implementation",
-                        "enable_hosted_tools": False,
-                        "reason": "Need to patch local code.",
-                    }
-                )
-            )
-        ]
-    )
-    router = Router(
-        client=client,
-        config=config,
-        llm_logger=LLMCallLogger(workspace / "llm_logs" / "all_llm_calls.jsonl"),
-    )
+def test_router_uses_preflight_research_before_formal_work() -> None:
+    state = AgentState(task="task1", shared_code_version="sha256:base")
 
-    decision = router.choose(
-        summary="Need to modify generated training code after a shape validation failure.",
-        task_id="autonomous",
-        step_id="step-001",
-        phase_hint="implementation",
-    )
+    decision = DeterministicRouter().choose(state, capability_ready=True, preflight_pending=True)
 
-    assert decision.profile == "coder"
+    assert decision.phase == "preflight"
+    assert decision.profile == "log_summarizer"
+    assert decision.allowed_tools == ["inspect_hdf5", "read_file"]
+    assert decision.allow_hosted_research is False
+    assert decision.requires_llm is True
+    assert decision.deterministic_action == "inspect_inputs_before_execution"
+    assert decision.reason_code == "preflight_pending"
+
+
+def test_router_selects_coder_once_shared_code_baseline_exists() -> None:
+    state = AgentState(task="task2", shared_code_version="sha256:ready")
+
+    decision = route_agent_state(state, capability_ready=True, preflight_pending=False)
+
     assert decision.phase == "implementation"
-    assert decision.enable_hosted_tools is False
-    assert client.calls[0]["profile"].name == "router"
+    assert decision.profile == "coder"
+    assert decision.allowed_tools == [
+        "read_file",
+        "write_file",
+        "patch_file",
+        "run_python",
+        "run_shell",
+        "inspect_hdf5",
+        "validate_submission",
+        "package_submission",
+    ]
+    assert decision.allow_hosted_research is False
+    assert decision.requires_llm is True
+    assert decision.deterministic_action == "implement_current_task"
+    assert decision.reason_code == "ready_for_implementation"
 
 
-def test_router_falls_back_to_deterministic_rule_on_invalid_json(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    client = FakeResponsesClient([_message_response("not-json")])
-    router = Router(
-        client=client,
-        config=config,
-        llm_logger=LLMCallLogger(workspace / "llm_logs" / "all_llm_calls.jsonl"),
+def test_router_uses_failure_recovery_without_legacy_llm_json_router() -> None:
+    state = AgentState(
+        task="task3",
+        shared_code_version="sha256:ready",
+        latest_error_type="shape_validation_failed",
     )
 
-    decision = router.choose(
-        summary="Need to validate final JSON bundle before packaging.",
-        task_id="autonomous",
-        step_id="step-002",
-        phase_hint="validation",
-    )
+    decision = DeterministicRouter().choose(state, capability_ready=True, preflight_pending=False)
 
-    assert decision.profile == "json_judge"
-    assert decision.phase == "validation"
-    assert decision.enable_hosted_tools is False
+    assert decision.phase == "failure_recovery"
+    assert decision.profile == "coder"
+    assert decision.allowed_tools == [
+        "read_file",
+        "patch_file",
+        "run_python",
+        "run_shell",
+        "validate_submission",
+    ]
+    assert decision.requires_llm is True
+    assert decision.allow_hosted_research is False
+    assert decision.deterministic_action == "recover_from_latest_error"
+    assert decision.reason_code == "shape_validation_failed"

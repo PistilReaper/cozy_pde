@@ -1,50 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import subprocess
-import sys
-import zipfile
 from pathlib import Path
+from textwrap import dedent
 
-import h5py
-import numpy as np
-import pytest
-
-from agent_runner.config import RunnerConfig
-from agent_runner.main import (
-    _build_deterministic_methodology_text,
-    _prepare_session_logs,
-    export_task_logs,
-    parse_args,
-    run_package_final,
-)
-from agent_runner.prompts import REHEARSAL_PROMPT, SYSTEM_PROMPT, TEST_TOOL_LOOP_PROMPT, build_task_instruction_block
+from cozy_pde_v3.agent_loop import run_formal_task_session
+from cozy_pde_v3.code_evolution import CodePatchRecord, CodeSnapshot
+from cozy_pde_v3.log_export import export_task_logs
+from cozy_pde_v3.memory_store import MemoryStore
+from cozy_pde_v3.task_specs import DEFAULT_TASK_SPECS
+from cozy_pde_v3.validation.submission import validate_submission_bundle_v3
 
 
-def _write_task_test(path, *, samples: int, total_steps: int, offset: float = 0.0) -> None:
-    array = (
-        np.arange(samples * total_steps * 256, dtype=np.float32).reshape(samples, total_steps, 256) / 1000.0
-    ) + offset
+def _write_task_log(path: Path, task: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(path, "w") as handle:
-        handle.create_dataset("tensor", data=array)
-
-
-def _write_task_bundle(workspace, task: str, *, samples: int, total_steps: int, input_steps: int, offset: float = 0.0) -> None:
-    submission_dir = workspace / "submission"
-    test_hdf5 = workspace / "data" / f"{task}_test.hdf5"
-    _write_task_test(test_hdf5, samples=samples, total_steps=total_steps, offset=offset)
-    with h5py.File(test_hdf5, "r") as source:
-        tensor = source["tensor"][:]
-    pred = tensor.copy()
-    pred[:, input_steps:, :] = pred[:, input_steps:, :] + 0.01
-    with h5py.File(submission_dir / f"{task}_pred.hdf5", "w") as handle:
-        handle.create_dataset("pred", data=pred)
-    (submission_dir / f"{task}_time.csv").write_text("train_time,inference_time\n1.0,0.2\n", encoding="utf-8")
-    (submission_dir / f"{task}_logs.log").write_text(
+    path.write_text(
         json.dumps(
             {
-                "timestamp": "2026-05-18T00:00:00+00:00",
+                "timestamp": "2026-05-22T00:00:00+00:00",
                 "elapsed_seconds": 0.1,
                 "response": f"{task} ok",
             }
@@ -54,266 +28,334 @@ def _write_task_bundle(workspace, task: str, *, samples: int, total_steps: int, 
     )
 
 
-def test_parse_args_accepts_single_task_autonomous():
-    args = parse_args(["--mode", "autonomous", "--config", "config.yaml", "--tasks", "task1"])
+def _write_valid_task_bundle(workspace: Path, task: str) -> None:
+    import h5py
+    import numpy as np
 
-    assert args.tasks == ["task1"]
-    assert args.allow_multi_task_session is False
+    data_path = workspace / "data" / f"{task}_test.hdf5"
+    tensor = np.linspace(0.0, 1.0, num=2 * 200 * 256, dtype=np.float32).reshape(2, 200, 256)
+    with h5py.File(data_path, "w") as handle:
+        handle.create_dataset("tensor", data=tensor)
+    with h5py.File(workspace / "submission" / f"{task}_pred.hdf5", "w") as handle:
+        pred = tensor.copy()
+        pred[:, 10:, :] = pred[:, 10:, :] + 0.05
+        handle.create_dataset("pred", data=pred)
+    (workspace / "submission" / f"{task}_time.csv").write_text(
+        "train_time,inference_time\n1.0,0.2\n",
+        encoding="utf-8",
+    )
+    _write_task_log(workspace / "submission" / f"{task}_logs.log", task)
 
 
-def test_parse_args_rejects_multi_task_autonomous_without_override(capsys):
-    with pytest.raises(SystemExit):
-        parse_args(["--mode", "autonomous", "--config", "config.yaml", "--tasks", "task1,task2"])
+def _write_shared_submission_code(workspace: Path) -> list[dict[str, object]]:
+    code_dir = workspace / "submission" / "code"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "train.py": dedent(
+            """
+            from __future__ import annotations
 
-    captured = capsys.readouterr()
-    assert "independent task sessions" in captured.err
+            import argparse
+            import json
+            from pathlib import Path
 
 
-def test_parse_args_allows_multi_task_autonomous_with_override():
-    args = parse_args(
+            def main() -> int:
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--task", required=True)
+                parser.add_argument("--config", required=True)
+                parser.add_argument("--data_dir", required=True)
+                parser.add_argument("--output_dir", required=True)
+                args = parser.parse_args()
+                output_dir = Path(args.output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "checkpoint.pt").write_text(
+                    json.dumps({"task": args.task, "config": args.config}),
+                    encoding="utf-8",
+                )
+                return 0
+
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ).strip()
+        + "\n",
+        "infer.py": dedent(
+            """
+            from __future__ import annotations
+
+            import argparse
+            import json
+            from pathlib import Path
+
+            import h5py
+            import numpy as np
+
+
+            _INPUT_STEPS = {"task1": 10, "task2": 10, "task3": 20}
+
+
+            def _first_dataset(handle: h5py.File):
+                datasets = []
+
+                def collect(_, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        datasets.append(obj)
+
+                handle.visititems(collect)
+                if not datasets:
+                    raise ValueError("missing dataset")
+                return datasets[0]
+
+
+            def main() -> int:
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--task", required=True)
+                parser.add_argument("--config", required=True)
+                parser.add_argument("--data_dir", required=True)
+                parser.add_argument("--output_dir")
+                parser.add_argument("--output")
+                args = parser.parse_args()
+
+                artifact_dir = Path(args.output_dir or Path(args.config).parent)
+                checkpoint_path = artifact_dir / "checkpoint.pt"
+                if not checkpoint_path.exists():
+                    raise FileNotFoundError("checkpoint.pt missing")
+                json.loads(checkpoint_path.read_text(encoding="utf-8"))
+
+                output_path = Path(args.output) if args.output else artifact_dir / f"{args.task}_pred.hdf5"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with h5py.File(Path(args.data_dir) / f"{args.task}_test.hdf5", "r") as source:
+                    tensor = np.asarray(_first_dataset(source)[...])
+                pred = tensor.copy()
+                pred[:, _INPUT_STEPS[args.task] :, :] = pred[:, _INPUT_STEPS[args.task] :, :] + np.float32(0.01)
+                with h5py.File(output_path, "w") as target:
+                    target.create_dataset("pred", data=pred)
+                return 0
+
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ).strip()
+        + "\n",
+        "validate.py": "print('validate')\n",
+    }
+    manifest_entries: list[dict[str, object]] = []
+    for index, (name, content) in enumerate(files.items(), start=1):
+        path = code_dir / name
+        path.write_text(content, encoding="utf-8")
+        payload = content.encode("utf-8")
+        manifest_entries.append(
+            {
+                "path": f"submission/code/{name}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "code_version": "v2",
+                "originating_task": "task1",
+                "patch_id": "patch-001",
+                "step_id": f"step-{index:03d}",
+                "task_id": "task1",
+                "timestamp": "2026-05-22T00:00:00+00:00",
+                "llm_call_ids": [f"call-{index}"],
+            }
+        )
+    return manifest_entries
+
+
+def _write_structured_submission_metadata(workspace: Path) -> None:
+    (workspace / "submission" / "methodology.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    (workspace / "submission" / "submission.json").write_text("{}", encoding="utf-8")
+
+
+def _write_incremental_records(workspace: Path, *, supported_tasks: list[str]) -> None:
+    store = MemoryStore(workspace / "internal_logs" / "memory.db")
+    store.initialize()
+    store.record_code_snapshot(
+        CodeSnapshot(
+            code_version="v1",
+            parent_version=None,
+            content_hash="sha256:root",
+            api_contract_hash="sha256:shared-cli-v1",
+            supported_tasks=[],
+            task_support_matrix={},
+            created_by_run_id="run-001",
+            created_at="2026-05-22T00:00:00Z",
+        )
+    )
+    store.record_code_snapshot(
+        CodeSnapshot(
+            code_version="v2",
+            parent_version="v1",
+            content_hash="sha256:final",
+            api_contract_hash="sha256:shared-cli-v1",
+            supported_tasks=supported_tasks,
+            task_support_matrix={task: {"compat": True} for task in supported_tasks},
+            created_by_run_id="run-001",
+            created_at="2026-05-22T00:05:00Z",
+        )
+    )
+    store.record_patch(
+        CodePatchRecord(
+            patch_id="patch-001",
+            base_code_version="v1",
+            new_code_version="v2",
+            task_context="task1",
+            changed_files=[
+                "submission/code/train.py",
+                "submission/code/infer.py",
+                "submission/code/validate.py",
+            ],
+            change_intent="Finalize shared session CLI",
+            backward_compatibility_claim="Shared CLI remains compatible",
+            affected_interfaces=["train.py", "infer.py"],
+            llm_call_ids=["call-1"],
+            validation_results={"task_compatibility": {task: True for task in supported_tasks}},
+        )
+    )
+
+
+class FakeResponsesClient:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(dict(kwargs))
+        if not self.responses:
+            raise AssertionError("no queued fake response")
+        return dict(self.responses.pop(0))
+
+
+def _provider_report_payload() -> dict[str, object]:
+    return {
+        "formal_ready": True,
+        "primary": {
+            "provider": "primary",
+            "model_id": "gpt-5.4",
+            "formal_ready": True,
+        },
+        "forced_failover": {"required": False},
+    }
+
+
+def _turn(response_id: str, output_items: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "provider": "primary",
+        "model": "gpt-5.4",
+        "raw_response": {"id": response_id, "model": "gpt-5.4", "output": output_items},
+        "standard_output_items": output_items,
+        "provider_output_items": output_items,
+        "usage": {"total_tokens": 10},
+    }
+
+
+def _config_stub(workspace: Path) -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        workspace_root=workspace,
+        task_specs=DEFAULT_TASK_SPECS,
+    )
+
+
+def test_single_task_log_export_writes_only_requested_task_log(workspace: Path) -> None:
+    _write_task_log(workspace / "llm_logs" / "task1_all_llm_calls.jsonl", "task1")
+    _write_task_log(workspace / "llm_logs" / "task2_all_llm_calls.jsonl", "task2")
+
+    result = export_task_logs(workspace, ["task2"])
+
+    assert result["ok"] is True
+    assert not (workspace / "submission" / "task1_logs.log").exists()
+    assert (workspace / "submission" / "task2_logs.log").read_text(encoding="utf-8") == (
+        workspace / "llm_logs" / "task2_all_llm_calls.jsonl"
+    ).read_text(encoding="utf-8")
+
+
+def test_shared_multi_task_log_export_requires_explicit_override(workspace: Path) -> None:
+    _write_task_log(workspace / "llm_logs" / "task1_task2_all_llm_calls.jsonl", "shared")
+
+    result = export_task_logs(workspace, ["task1", "task2"], allow_multi_task_session=False)
+
+    assert result["ok"] is False
+    assert "independent task sessions" in result["error"]
+
+
+def test_shared_multi_task_log_export_can_copy_shared_session_log(workspace: Path) -> None:
+    _write_task_log(workspace / "llm_logs" / "task1_task2_all_llm_calls.jsonl", "shared")
+
+    result = export_task_logs(workspace, ["task1", "task2"], allow_multi_task_session=True)
+
+    assert result["ok"] is True
+    exported = (workspace / "submission" / "task1_logs.log").read_text(encoding="utf-8")
+    assert exported == (workspace / "submission" / "task2_logs.log").read_text(encoding="utf-8")
+
+
+def test_single_task_validation_uses_shared_submission_code_layout(workspace: Path) -> None:
+    _write_valid_task_bundle(workspace, "task1")
+    code_manifest_entries = _write_shared_submission_code(workspace)
+    _write_structured_submission_metadata(workspace)
+    _write_incremental_records(workspace, supported_tasks=["task1"])
+
+    result = validate_submission_bundle_v3(
+        workspace_root=workspace,
+        tasks=["task1"],
+        strict=True,
+        code_manifest_entries=code_manifest_entries,
+        methodology_sources=["code_patch_records"],
+    )
+
+    assert result["ok"] is True
+    finalize_gate = result["data"]["finalize_gate"]
+    assert finalize_gate["shared_code_ok"] is True
+    assert finalize_gate["no_task_specific_code_fork_ok"] is True
+    assert finalize_gate["supported_tasks"] == ["task1"]
+
+
+def test_single_task_formal_session_writes_shared_submission_code_and_single_log(workspace: Path) -> None:
+    provider_report_path = workspace / "provider_report.json"
+    provider_report_path.write_text(json.dumps(_provider_report_payload()), encoding="utf-8")
+    client = FakeResponsesClient(
         [
-            "--mode",
-            "autonomous",
-            "--config",
-            "config.yaml",
-            "--tasks",
-            "task1,task2",
-            "--allow-multi-task-session",
+            _turn(
+                "resp_write",
+                [
+                    {
+                        "type": "function_call",
+                        "name": "write_file",
+                        "call_id": "call_1",
+                        "arguments": json.dumps(
+                            {
+                                "path": "submission/code/train.py",
+                                "content": "print('train shared')\n",
+                            }
+                        ),
+                    }
+                ],
+            ),
+            _turn(
+                "resp_done",
+                [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "FORMAL_DONE"}],
+                    }
+                ],
+            ),
         ]
     )
 
-    assert args.tasks == ["task1", "task2"]
-    assert args.allow_multi_task_session is True
-
-
-def test_runner_config_task_scoped_log_paths_are_distinct(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-
-    task1_config = config.with_session("task1")
-    task2_config = config.with_session("task2")
-
-    assert task1_config.llm_log_path == workspace / "llm_logs" / "task1_all_llm_calls.jsonl"
-    assert task2_config.llm_log_path == workspace / "llm_logs" / "task2_all_llm_calls.jsonl"
-    assert task1_config.tool_log_path == workspace / "internal_logs" / "task1_tool_calls.jsonl"
-    assert task2_config.tool_log_path == workspace / "internal_logs" / "task2_tool_calls.jsonl"
-    assert task1_config.llm_log_path != task2_config.llm_log_path
-    assert task1_config.tool_log_path != task2_config.tool_log_path
-
-
-def test_starting_task2_session_does_not_delete_task1_logs(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    task1_config = config.with_session("task1")
-    task2_config = config.with_session("task2")
-
-    _prepare_session_logs(task1_config)
-    task1_config.llm_log_path.write_text('{"task":"task1"}\n', encoding="utf-8")
-    task1_config.tool_log_path.write_text('{"task":"task1"}\n', encoding="utf-8")
-
-    _prepare_session_logs(task2_config)
-
-    assert task1_config.llm_log_path.read_text(encoding="utf-8") == '{"task":"task1"}\n'
-    assert task1_config.tool_log_path.read_text(encoding="utf-8") == '{"task":"task1"}\n'
-    assert task2_config.llm_log_path.read_text(encoding="utf-8") == ""
-    assert task2_config.tool_log_path.read_text(encoding="utf-8") == ""
-
-
-def test_export_task_logs_writes_only_requested_task_log(workspace):
-    task1_log = workspace / "llm_logs" / "task1_all_llm_calls.jsonl"
-    task2_log = workspace / "llm_logs" / "task2_all_llm_calls.jsonl"
-    task1_log.write_text(
-        json.dumps({"timestamp": "2026-05-18T00:00:00+00:00", "elapsed_seconds": 0.1, "response": "task1"})
-        + "\n",
-        encoding="utf-8",
+    result = run_formal_task_session(
+        config=_config_stub(workspace),
+        task="task1",
+        provider_report_path=provider_report_path,
+        responses_client=client,
     )
-    task2_log.write_text(
-        json.dumps({"timestamp": "2026-05-18T00:00:01+00:00", "elapsed_seconds": 0.2, "response": "task2"})
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = export_task_logs(workspace=workspace, tasks=["task2"])
 
     assert result["ok"] is True
-    assert (workspace / "submission" / "task1_logs.log").exists() is False
-    assert (workspace / "submission" / "task2_logs.log").read_text(encoding="utf-8") == task2_log.read_text(encoding="utf-8")
-
-
-def test_export_task_logs_copies_shared_multi_task_session_when_allowed(workspace):
-    shared_log = workspace / "llm_logs" / "task1_task2_all_llm_calls.jsonl"
-    shared_log.write_text(
-        json.dumps({"timestamp": "2026-05-18T00:00:00+00:00", "elapsed_seconds": 0.1, "response": "shared"})
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = export_task_logs(workspace=workspace, tasks=["task1", "task2"], allow_multi_task_session=True)
-
-    assert result["ok"] is True
-    task1_export = (workspace / "submission" / "task1_logs.log").read_text(encoding="utf-8")
-    task2_export = (workspace / "submission" / "task2_logs.log").read_text(encoding="utf-8")
-    assert task1_export == shared_log.read_text(encoding="utf-8")
-    assert task2_export == shared_log.read_text(encoding="utf-8")
-
-
-def test_package_final_validates_selected_tasks_and_creates_submission_zip(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    _write_task_bundle(workspace, "task1", samples=2, total_steps=200, input_steps=10)
-    _write_task_bundle(workspace, "task3", samples=1000, total_steps=400, input_steps=20, offset=10.0)
-    (workspace / "submission" / "code" / "task1").mkdir(parents=True, exist_ok=True)
-    (workspace / "submission" / "code" / "task1" / "generated.py").write_text("print('task1')\n", encoding="utf-8")
-    (workspace / "submission" / "code" / "task3").mkdir(parents=True, exist_ok=True)
-    (workspace / "submission" / "code" / "task3" / "generated.py").write_text("print('task3')\n", encoding="utf-8")
-    (workspace / "submission" / "README.md").write_text("# Submission\n\nTask outputs are packaged here.\n", encoding="utf-8")
-
-    exit_code = run_package_final(config, tasks=["task1", "task3"])
-
-    assert exit_code == 0
-    assert (workspace / "submission" / "submission.json").exists()
-    assert (workspace / "submission" / "methodology.pdf").exists()
-    assert (workspace / "submission" / "submission.zip").exists()
-
-
-def test_task_prompt_blocks_include_required_hard_rules():
-    task1_block = build_task_instruction_block("task1")
-    task2_block = build_task_instruction_block("task2")
-    task3_block = build_task_instruction_block("task3")
-
-    assert "official Task 1 PDEBench checkpoints may be used" in task1_block
-    assert "workspace/checkpoints/task1_official/" in task1_block
-    assert "workspace/submission/task1_pred.hdf5" in task1_block
-    assert "workspace/submission/code/task1/" in task1_block
-
-    assert "trained from scratch" in task2_block
-    assert "Do not use Task 1 data, Task 1 checkpoint, or Task 1 fine-tuned weights" in task2_block
-    assert "workspace/submission/task2_pred.hdf5" in task2_block
-    assert "workspace/submission/code/task2/" in task2_block
-
-    assert "Kuramoto-Sivashinsky" in task3_block
-    assert "unknown `lambda2` at test time" in task3_block
-    assert "train from scratch" in task3_block
-    assert "workspace/submission/task3_pred.hdf5" in task3_block
-    assert "parameter inference in logs" in task3_block
-    assert "workspace/submission/code/task3/" in task3_block
-    assert "Do not use Task 1 or Task 2 weights for Task 3" in SYSTEM_PROMPT
-
-
-def test_runner_prompt_constants_are_english():
-    assert "autonomous scientific research agent" in SYSTEM_PROMPT
-    assert "This is a rehearsal" in REHEARSAL_PROMPT
-    assert "Use `write_file`" in TEST_TOOL_LOOP_PROMPT
-    for text in (SYSTEM_PROMPT, REHEARSAL_PROMPT, TEST_TOOL_LOOP_PROMPT):
-        assert "你" not in text
-        assert "请" not in text
-        assert "必须" not in text
-
-
-def test_deterministic_methodology_text_describes_runner_architecture_and_no_fake_experiments():
-    text = _build_deterministic_methodology_text(["task1", "task2", "task3"])
-
-    assert "CozyPDE Deterministic Methodology" in text
-    assert "task-isolated formal sessions" in text
-    assert "tool-mediated file generation" in text
-    assert "logging and provenance" in text
-    assert "experiment loop" in text
-    assert "This document does not claim task-specific model results" in text
-    assert "Task 1, Task 2, and Task 3" in text
-
-
-def test_package_final_rejects_task2_code_that_references_task1_checkpoint(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    _write_task_bundle(workspace, "task2", samples=2, total_steps=200, input_steps=10)
-    (workspace / "submission" / "code" / "task2").mkdir(parents=True, exist_ok=True)
-    (workspace / "submission" / "code" / "task2" / "train.py").write_text(
-        "CKPT = 'workspace/checkpoints/task1_official/1D_Burgers_Sols_Nu0.001_FNO.pt'\n",
-        encoding="utf-8",
-    )
-
-    exit_code = run_package_final(config, tasks=["task2"])
-
-    assert exit_code == 1
-    assert not (workspace / "submission" / "submission.zip").exists()
-
-
-def test_package_final_rejects_task3_code_that_references_task2_weights(workspace):
-    config = RunnerConfig.from_workspace(workspace)
-    _write_task_bundle(workspace, "task3", samples=1000, total_steps=400, input_steps=20)
-    (workspace / "submission" / "code" / "task3").mkdir(parents=True, exist_ok=True)
-    (workspace / "submission" / "code" / "task3" / "infer.py").write_text(
-        "resume_path = 'workspace/runs/task2/checkpoints/best_task2_model.pth'\n",
-        encoding="utf-8",
-    )
-
-    exit_code = run_package_final(config, tasks=["task3"])
-
-    assert exit_code == 1
-    assert not (workspace / "submission" / "submission.zip").exists()
-
-
-def test_package_final_cli_builds_zip_with_only_expected_submission_files(workspace):
-    _write_task_bundle(workspace, "task1", samples=2, total_steps=200, input_steps=10)
-    _write_task_bundle(workspace, "task2", samples=2, total_steps=200, input_steps=10, offset=10.0)
-    _write_task_bundle(workspace, "task3", samples=1000, total_steps=400, input_steps=20, offset=20.0)
-    for task in ("task1", "task2", "task3"):
-        task_dir = workspace / "submission" / "code" / task
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "generated.py").write_text(f"print('{task}')\n", encoding="utf-8")
-    (workspace / "submission" / "code" / "train.py").write_text("print('train')\n", encoding="utf-8")
-    (workspace / "submission" / "code" / "infer.py").write_text("print('infer')\n", encoding="utf-8")
-    (workspace / "submission" / "code" / "README.md").write_text("# code\n", encoding="utf-8")
-    (workspace / "submission" / "sample_submission.txt").write_text("do not package\n", encoding="utf-8")
-    (workspace / "submission" / "old.log").write_text("old\n", encoding="utf-8")
-    (workspace / "data" / "do_not_package.txt").write_text("data\n", encoding="utf-8")
-    (workspace / "runs" / "do_not_package.txt").write_text("runs\n", encoding="utf-8")
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_runner.main",
-            "--mode",
-            "package_final",
-            "--config",
-            "agent_runner/config.example.yaml",
-            "--workspace",
-            str(workspace),
-            "--tasks",
-            "task1,task2,task3",
-        ],
-        cwd="/home/cty/cozy_pde",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    zip_path = workspace / "submission" / "submission.zip"
-    assert zip_path.exists()
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        names = sorted(archive.namelist())
-
-    assert "submission.json" in names
-    assert "methodology.pdf" in names
-    assert "manifest.json" in names
-    assert "task1_pred.hdf5" in names
-    assert "task2_pred.hdf5" in names
-    assert "task3_pred.hdf5" in names
-    assert "code/task1/generated.py" in names
-    assert "code/task2/generated.py" in names
-    assert "code/task3/generated.py" in names
-    assert "code/train.py" in names
-    assert "code/infer.py" in names
-    assert "code/README.md" in names
-    assert "sample_submission.txt" not in names
-    assert "old.log" not in names
-    assert all(not name.startswith("data/") for name in names)
-    assert all(not name.startswith("checkpoints/") for name in names)
-    assert all(not name.startswith("runs/") for name in names)
-
-
-def test_pytest_ini_limits_collection_to_repo_tests():
-    text = Path("/home/cty/cozy_pde/pytest.ini").read_text(encoding="utf-8")
-
-    assert "testpaths = tests" in text
-    assert "norecursedirs =" in text
-    assert "workspace/baselines" in text
-    assert ".venv" in text
+    assert result["state"]["task"] == "task1"
+    assert (workspace / "submission" / "code" / "train.py").exists()
+    assert not (workspace / "submission" / "code" / "task1").exists()
+    assert (workspace / "llm_logs" / "all_llm_calls.jsonl").exists()

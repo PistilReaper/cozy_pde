@@ -28,3 +28,22 @@ def test_validate_submission_rejects_wrong_prediction_shape(valid_submission_bun
 
     assert result["ok"] is False
     assert "shape" in result["error"].lower()
+
+
+def test_validate_submission_prefers_tensor_dataset_over_coordinate_metadata(valid_submission_bundle, fake_test_hdf5):
+    structured_test_hdf5 = valid_submission_bundle.parent / "structured_test.hdf5"
+    with h5py.File(fake_test_hdf5, "r") as source:
+        tensor = source["tensor"][:]
+
+    with h5py.File(structured_test_hdf5, "w") as handle:
+        handle.create_dataset("t-coordinate", data=np.linspace(0.0, 1.0, num=200, dtype=np.float32))
+        handle.create_dataset("tensor", data=tensor)
+        handle.create_dataset("x-coordinate", data=np.linspace(-1.0, 1.0, num=256, dtype=np.float32))
+
+    result = validate_submission(
+        submission_dir=valid_submission_bundle,
+        test_hdf5=structured_test_hdf5,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["pred_shape"] == [2, 200, 256]

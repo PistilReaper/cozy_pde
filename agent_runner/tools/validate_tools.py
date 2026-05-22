@@ -172,16 +172,19 @@ def validate_responses_logs(path: str | Path, *, workspace_root: str | Path | No
 
 
 def _first_dataset(handle: h5py.File) -> h5py.Dataset:
-    datasets: list[h5py.Dataset] = []
+    datasets: list[tuple[str, h5py.Dataset]] = []
 
-    def collect(_: str, obj: object) -> None:
+    def collect(name: str, obj: object) -> None:
         if isinstance(obj, h5py.Dataset):
-            datasets.append(obj)
+            datasets.append((name, obj))
 
     handle.visititems(collect)
     if not datasets:
         raise ValueError("No dataset found in HDF5 file")
-    return datasets[0]
+    for name, dataset in datasets:
+        if name.rsplit("/", 1)[-1] == "tensor":
+            return dataset
+    return max(datasets, key=lambda item: (item[1].ndim, item[1].size))[1]
 
 
 def _validate_time_csv(path: Path) -> tuple[bool, str, dict[str, float] | None]:
@@ -252,7 +255,7 @@ def validate_submission(
         except Exception as exc:  # noqa: BLE001
             return failure("validate_submission", f"Failed to read test HDF5: {exc}", test_hdf5=str(test_hdf5))
 
-        if test.shape[1] < input_steps or test.shape[2] != expected_spatial_points:
+        if test.ndim != 3 or test.shape[1] < input_steps or test.shape[2] != expected_spatial_points:
             return failure("validate_submission", "Test HDF5 shape is incompatible with prediction", test_shape=list(test.shape), pred_shape=list(pred.shape))
         if rehearsal_mode and pred.shape[0] <= test.shape[0]:
             rehearsal_only = pred.shape[0] < test.shape[0]

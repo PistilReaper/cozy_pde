@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,11 @@ DEFAULT_RESEARCH_BLOCKED_EXTENSIONS = [
     ".tar",
     ".zip",
 ]
+DEFAULT_FORMAL_VALIDATION_RMSE_THRESHOLD = 0.01
+
+
+def _utc_run_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _load_project_dotenv(project_root: Path) -> None:
@@ -96,6 +102,7 @@ def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
             time_filename="task1_time.csv",
             logs_filename="task1_logs.log",
             test_hdf5="data/task1_test.hdf5",
+            validation_hdf5="data/task1_val.hdf5",
             input_steps=10,
             total_steps=200,
             spatial_points=256,
@@ -106,6 +113,7 @@ def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
             time_filename="task2_time.csv",
             logs_filename="task2_logs.log",
             test_hdf5="data/task2_test.hdf5",
+            validation_hdf5="data/task2_val.h5",
             input_steps=10,
             total_steps=200,
             spatial_points=256,
@@ -116,6 +124,7 @@ def _default_submission_tasks() -> dict[str, "SubmissionTaskConfig"]:
             time_filename="task3_time.csv",
             logs_filename="task3_logs.log",
             test_hdf5="data/task3_test.hdf5",
+            validation_hdf5="data/KS_val.hdf5",
             input_steps=20,
             total_steps=400,
             spatial_points=256,
@@ -196,12 +205,55 @@ class FallbackProviderConfig:
 
 
 @dataclass(slots=True)
+class LogProxyConfig:
+    enabled: bool = False
+    base_url: str = "http://localhost:8080"
+    target: str = "https://aixj.vip"
+    log_dir: Path | str = "workspace/proxy_logs/aixj"
+    fallback_base_url: str | None = "http://localhost:8081"
+    fallback_target: str | None = "https://api.deepseek.com"
+    fallback_log_dir: Path | str | None = "workspace/proxy_logs/deepseek"
+    proxy_script: str = "scripts/proxy.py"
+
+    def resolve_paths(self, workspace_root: Path, project_root: Path) -> None:
+        self.log_dir = self._resolve_single_path(self.log_dir, workspace_root, project_root)
+        fallback_log_dir = self.fallback_log_dir or self.log_dir
+        self.fallback_log_dir = self._resolve_single_path(fallback_log_dir, workspace_root, project_root)
+
+    @staticmethod
+    def _resolve_single_path(path_value: Path | str, workspace_root: Path, project_root: Path) -> Path:
+        path = Path(path_value)
+        if not path.is_absolute():
+            if path.parts and path.parts[0] == "workspace":
+                path = (workspace_root / Path(*path.parts[1:])).resolve()
+            else:
+                path = (project_root / path).resolve()
+        return path
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LogProxyConfig":
+        data = data or {}
+        defaults = cls()
+        return cls(
+            enabled=bool(data.get("enabled", defaults.enabled)),
+            base_url=str(data.get("base_url", defaults.base_url)),
+            target=str(data.get("target", defaults.target)),
+            log_dir=data.get("log_dir", defaults.log_dir),
+            fallback_base_url=str(data.get("fallback_base_url", data.get("base_url", defaults.base_url))),
+            fallback_target=str(data.get("fallback_target", data.get("target", defaults.target))),
+            fallback_log_dir=data.get("fallback_log_dir", data.get("log_dir", defaults.log_dir)),
+            proxy_script=str(data.get("proxy_script", defaults.proxy_script)),
+        )
+
+
+@dataclass(slots=True)
 class SubmissionTaskConfig:
     name: str
     pred_filename: str
     time_filename: str
     logs_filename: str
     test_hdf5: str
+    validation_hdf5: str | None = None
     input_steps: int = 10
     total_steps: int = 200
     spatial_points: int = 256
@@ -216,6 +268,7 @@ class SubmissionTaskConfig:
             time_filename=str(data.get("time_filename", defaults.time_filename)),
             logs_filename=str(data.get("logs_filename", defaults.logs_filename)),
             test_hdf5=str(data.get("test_hdf5", defaults.test_hdf5)),
+            validation_hdf5=data.get("validation_hdf5", defaults.validation_hdf5),
             input_steps=int(data.get("input_steps", defaults.input_steps)),
             total_steps=int(data.get("total_steps", defaults.total_steps)),
             spatial_points=int(data.get("spatial_points", defaults.spatial_points)),
@@ -476,10 +529,13 @@ class ResearchConfig:
     papers_dir: Path | None = None
     cache_index_path: Path | None = None
 
-    def resolve_paths(self, project_root: Path) -> None:
+    def resolve_paths(self, workspace_root: Path, project_root: Path) -> None:
         cache_dir = Path(self.cache_dir)
         if not cache_dir.is_absolute():
-            cache_dir = (project_root / cache_dir).resolve()
+            if cache_dir.parts and cache_dir.parts[0] == "workspace":
+                cache_dir = (workspace_root / Path(*cache_dir.parts[1:])).resolve()
+            else:
+                cache_dir = (project_root / cache_dir).resolve()
         self.cache_dir = cache_dir
         self.raw_cache_dir = cache_dir / "raw"
         self.papers_dir = cache_dir.parent / "papers"
@@ -513,8 +569,10 @@ class ResearchConfig:
 class RunnerConfig:
     project_root: Path
     workspace_root: Path
+    shared_workspace_root: Path | None = None
     endpoint: OpenAIEndpointConfig = field(default_factory=OpenAIEndpointConfig)
     fallback_provider: FallbackProviderConfig = field(default_factory=FallbackProviderConfig)
+    log_proxy: LogProxyConfig = field(default_factory=LogProxyConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     llm_profiles: dict[str, LLMProfile] = field(default_factory=_default_profiles)
     submission_tasks: dict[str, SubmissionTaskConfig] = field(default_factory=_default_submission_tasks)
@@ -528,17 +586,19 @@ class RunnerConfig:
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
         self.workspace_root = self.workspace_root.resolve()
+        if self.shared_workspace_root is None:
+            self.shared_workspace_root = self.workspace_root
+        else:
+            self.shared_workspace_root = self.shared_workspace_root.resolve()
         self.endpoint.resolve_env()
         self.fallback_provider.resolve_env()
         self.llm_profiles = dict(self.llm_profiles)
         self.submission_tasks = dict(self.submission_tasks)
         self._validate_profile_set()
-        self.research.resolve_paths(self.project_root)
+        self.log_proxy.resolve_paths(self.workspace_root, self.project_root)
+        self.research.resolve_paths(self.workspace_root, self.project_root)
         if self.shell_log_dir is None:
-            if self.session_label:
-                self.shell_log_dir = self.workspace_root / "runs" / self.session_label / "logs"
-            else:
-                self.shell_log_dir = self.workspace_root / "runs" / "logs"
+            self.shell_log_dir = self.workspace_root / "runs" / "logs"
 
     def _validate_profile_set(self) -> None:
         missing = [name for name in REQUIRED_PROFILE_NAMES if name not in self.llm_profiles]
@@ -579,13 +639,28 @@ class RunnerConfig:
         return self.submission_code_dir / name
 
     def with_session(self, session_label: str) -> "RunnerConfig":
+        run_root = self.shared_workspace_root / "runs" / f"{session_label}_{_utc_run_stamp()}"
         session_config = replace(
             self,
+            workspace_root=run_root,
+            shared_workspace_root=self.shared_workspace_root,
             session_label=session_label,
-            shell_log_dir=self.workspace_root / "runs" / session_label / "logs",
+            shell_log_dir=run_root / "runs" / "logs",
         )
         session_config.ensure_workspace_dirs()
         return session_config
+
+    def _ensure_linked_shared_dir(self, relative: str) -> None:
+        assert self.shared_workspace_root is not None
+        source = self.shared_workspace_root / relative
+        target = self.workspace_root / relative
+        source.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            return
+        if target.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
 
     @property
     def router_profile(self) -> LLMProfile:
@@ -600,20 +675,37 @@ class RunnerConfig:
         )
 
     def ensure_workspace_dirs(self) -> None:
-        for relative in [
-            "data",
-            "checkpoints",
-            "baselines",
-            "runs/scratch",
-            "runs/logs",
-            "runs/snapshots",
-            "internal_logs",
-            "llm_logs",
-            "research/cache/raw",
-            "research/papers",
-            "submission/code",
-        ]:
-            (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
+        if self.workspace_root == self.shared_workspace_root:
+            for relative in [
+                "data",
+                "checkpoints",
+                "baselines",
+                "runs/scratch",
+                "runs/logs",
+                "runs/snapshots",
+                "internal_logs",
+                "llm_logs",
+                "research/cache/raw",
+                "research/papers",
+                "proxy_logs",
+                "submission/code",
+            ]:
+                (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
+        else:
+            for relative in [
+                "runs/scratch",
+                "runs/logs",
+                "runs/snapshots",
+                "internal_logs",
+                "llm_logs",
+                "research/cache/raw",
+                "research/papers",
+                "proxy_logs",
+                "submission/code",
+            ]:
+                (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
+            for relative in ["data", "checkpoints", "baselines"]:
+                self._ensure_linked_shared_dir(relative)
         assert self.shell_log_dir is not None
         self.shell_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -622,7 +714,7 @@ class RunnerConfig:
         workspace_root = Path(workspace_root)
         project_root = Path(project_root) if project_root is not None else workspace_root.parent
         _load_project_dotenv(project_root)
-        config = cls(project_root=project_root, workspace_root=workspace_root)
+        config = cls(project_root=project_root, workspace_root=workspace_root, shared_workspace_root=workspace_root)
         config.ensure_workspace_dirs()
         return config
 
@@ -652,8 +744,10 @@ def load_config(config_path: str | Path, workspace_override: str | Path | None =
     config = RunnerConfig(
         project_root=project_root,
         workspace_root=workspace_root,
+        shared_workspace_root=workspace_root,
         endpoint=OpenAIEndpointConfig.from_dict(raw.get("openai")),
         fallback_provider=FallbackProviderConfig.from_dict(raw.get("fallback_provider")),
+        log_proxy=LogProxyConfig.from_dict(raw.get("log_proxy")),
         router=RouterConfig.from_dict(raw.get("router")),
         llm_profiles=llm_profiles,
         submission_tasks=submission_tasks,

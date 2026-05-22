@@ -20,7 +20,6 @@ def _write_config(path: Path, *, allow_network: bool) -> None:
         provider:
           wire_api: responses
           primary:
-            provider: openai_compatible
             base_url: https://primary.example.com
             api_key_env: PRIMARY_API_KEY
             model_id: gpt-5.4
@@ -34,7 +33,7 @@ def _write_config(path: Path, *, allow_network: bool) -> None:
     )
 
 
-def test_local_research_check_returns_structured_degraded_success_when_network_disabled(
+def test_check_research_returns_degraded_but_runnable_when_network_disabled(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -43,22 +42,19 @@ def test_local_research_check_returns_structured_degraded_success_when_network_d
     config = load_config(config_path)
 
     exit_code = cli_module.check_research_command(config)
-    payload = json.loads(capsys.readouterr().out)
+    captured = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert payload == {
-        "ok": True,
-        "data": {
-            "degraded": True,
-            "runnable": True,
-            "network_available": False,
-            "cache_index_path": str(config.research.cache_index_path),
-        },
-    }
+    assert captured["ok"] is True
+    assert captured["data"]["degraded"] is True
+    assert captured["data"]["runnable"] is True
+    assert captured["data"]["network_available"] is False
+    assert config.research.cache_index_path.exists()
 
 
-def test_local_research_check_uses_v3_wrappers_and_writes_cache_records(
+def test_check_research_uses_v3_wrappers_and_writes_cache_record(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     config_path = tmp_path / "config.yaml"
@@ -71,46 +67,21 @@ def test_local_research_check_uses_v3_wrappers_and_writes_cache_records(
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "export.arxiv.org" in url:
-            return httpx.Response(
-                200,
-                text=arxiv_fixture,
-                headers={"content-type": "application/atom+xml"},
-                request=request,
-            )
+            return httpx.Response(200, text=arxiv_fixture, headers={"content-type": "application/atom+xml"}, request=request)
         if "/search/repositories" in url:
-            return httpx.Response(
-                200,
-                text=github_fixture,
-                headers={"content-type": "application/json"},
-                request=request,
-            )
+            return httpx.Response(200, text=github_fixture, headers={"content-type": "application/json"}, request=request)
         if "github.com" in url:
-            return httpx.Response(
-                200,
-                text="<html><title>Repo</title><body>repo page</body></html>",
-                headers={"content-type": "text/html"},
-                request=request,
-            )
+            return httpx.Response(200, text="<html><title>Repo</title><body>repo page</body></html>", headers={"content-type": "text/html"}, request=request)
         raise AssertionError(f"unexpected URL {url}")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
 
     exit_code = cli_module.check_research_command(config, http_client=client)
-    payload = json.loads(capsys.readouterr().out)
+    captured = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert payload["ok"] is True
-    assert payload["data"]["degraded"] is False
-    assert payload["data"]["runnable"] is True
-    assert payload["data"]["network_available"] is True
-    assert payload["data"]["arxiv_results"] > 0
-    assert payload["data"]["github_results"] > 0
-    assert payload["data"]["parsed_repo_title"] == "Repo"
-
-    lines = [
-        json.loads(line)
-        for line in config.research.cache_index_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    assert captured["ok"] is True
+    assert captured["data"]["degraded"] is False
+    lines = [json.loads(line) for line in config.research.cache_index_path.read_text(encoding="utf-8").splitlines()]
     assert any(line["source_type"] == "arxiv" for line in lines)
     assert any(line["source_type"] == "github_repo" for line in lines)

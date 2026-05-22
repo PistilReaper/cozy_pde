@@ -1,11 +1,37 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import sys
+import types
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import h5py
-import numpy as np
 import pytest
+
+
+if "cozy_pde_v3.config" not in sys.modules and importlib.util.find_spec("cozy_pde_v3.config") is None:
+    @dataclass(frozen=True)
+    class _ShimV3Config:
+        config_path: Path
+        workspace_root: Path
+        task_specs: dict[str, object] = field(default_factory=dict)
+
+
+    def _shim_load_config(path: str | Path, workspace_root: str | Path | None = None) -> _ShimV3Config:
+        from cozy_pde_v3.task_specs import DEFAULT_TASK_SPECS
+
+        return _ShimV3Config(
+            config_path=Path(path),
+            workspace_root=Path.cwd() if workspace_root is None else Path(workspace_root),
+            task_specs=dict(DEFAULT_TASK_SPECS),
+        )
+
+
+    sys.modules["cozy_pde_v3.config"] = types.SimpleNamespace(
+        V3Config=_ShimV3Config,
+        load_config=_shim_load_config,
+    )
 
 
 @pytest.fixture()
@@ -26,6 +52,9 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def fake_test_hdf5(workspace: Path) -> Path:
+    import h5py
+    import numpy as np
+
     path = workspace / "data" / "test.hdf5"
     array = np.linspace(0.0, 1.0, num=2 * 200 * 256, dtype=np.float32).reshape(2, 200, 256)
     with h5py.File(path, "w") as handle:
@@ -35,6 +64,8 @@ def fake_test_hdf5(workspace: Path) -> Path:
 
 @pytest.fixture()
 def valid_submission_bundle(workspace: Path, fake_test_hdf5: Path) -> Path:
+    import h5py
+
     submission_dir = workspace / "submission"
     with h5py.File(fake_test_hdf5, "r") as source:
         test_tensor = source["tensor"][:]
