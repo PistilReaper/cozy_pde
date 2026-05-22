@@ -1,0 +1,34 @@
+# PDE Neural Operator Research Agent 配置文件
+# 请填写你的 LLM API Key，然后运行 python run_agent.py
+
+llm:
+  api_key: "sk-3430b9c715a1a3706c3f4dec14dccf54d8d6fb2b4e57b4124252dfe5fa64e6b3"
+  base_url: "https://aixj.vip/v1"
+  model: "gpt-5.4"
+  temperature: 1.0
+  max_tokens: 4096
+  timeout: 120.0
+
+research:
+  max_iterations: 15
+  max_time_hours: 10.5
+  early_stop_patience: 3
+  task: "task1"
+  data_dir: "./data_and_sample_submission/train_val_test_init"
+  output_dir: "./output"
+  code_dir: "./code"
+
+model:
+  model_type: "fno"
+  modes: 16
+  width: 64
+  depth: 4
+  batch_size: 16
+  epochs: 100
+  lr: 0.001
+  scheduler_step: 20
+  scheduler_gamma: 0.5
+  use_physics_loss: false
+  physics_weight: 0.1
+  use_pushforward: true
+  pushforward_schedule: [10, 30, 60]
